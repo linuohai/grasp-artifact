@@ -1,0 +1,1546 @@
+// Copyright (c) 2018-2021, Mahmoud Khairy, Vijay Kandiah, Timothy Rogers, Tor
+// M. Aamodt, Nikos Hardavellas
+// Northwestern University, Purdue University, The University of British
+// Columbia
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice,
+// this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of Northwestern University, Purdue University,
+//    The University of British Columbia nor the names of their contributors
+//    may be used to endorse or promote products derived from this software
+//    without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include <bits/stdc++.h>
+#include <math.h>
+#include <stdio.h>
+#include <time.h>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "../ISA_Def/accelwattch_component_mapping.h"
+#include "../ISA_Def/ampere_opcode.h"
+#include "../ISA_Def/kepler_opcode.h"
+#include "../ISA_Def/pascal_opcode.h"
+#include "../ISA_Def/trace_opcode.h"
+#include "../ISA_Def/turing_opcode.h"
+#include "../ISA_Def/volta_opcode.h"
+#include "abstract_hardware_model.h"
+#include "cuda-sim/cuda-sim.h"
+#include "cuda-sim/ptx_ir.h"
+#include "cuda-sim/ptx_parser.h"
+#include "gpgpu-sim/gpu-sim.h"
+#include "gpgpu_context.h"
+#include "gpgpusim_entrypoint.h"
+#include "option_parser.h"
+#include "trace_driven.h"
+
+namespace {
+
+struct loaded_ima_chain_row_t {
+  std::string kernel;
+  std::string function;
+  std::string impl;
+  std::string sm;
+  std::string classification;
+  unsigned pc_idx = 0;
+  unsigned pc_addr = 0;
+  unsigned pc_data = 0;
+  // P5: data source location for merge key (chains sharing same target array)
+  std::string data_source_file;
+  std::string data_source_line;
+  int stride_hint = 0;  // speculative stride from SASS analysis (0=use default)
+};
+
+static std::string trim_copy(const std::string &in) {
+  size_t start = 0;
+  while (start < in.size() && isspace(static_cast<unsigned char>(in[start])))
+    ++start;
+  size_t end = in.size();
+  while (end > start && isspace(static_cast<unsigned char>(in[end - 1]))) --end;
+  return in.substr(start, end - start);
+}
+
+static std::vector<std::string> split_csv_line(const std::string &line) {
+  std::vector<std::string> fields;
+  std::string cur;
+  bool in_quotes = false;
+  for (char ch : line) {
+    if (ch == '"') {
+      in_quotes = !in_quotes;
+      continue;
+    }
+    if (ch == ',' && !in_quotes) {
+      fields.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(ch);
+    }
+  }
+  fields.push_back(cur);
+  for (std::string &field : fields) field = trim_copy(field);
+  return fields;
+}
+
+static bool parse_hex_pc(const std::string &text, unsigned &value) {
+  std::string s = trim_copy(text);
+  if (s.empty()) return false;
+  try {
+    value = static_cast<unsigned>(std::stoul(s, nullptr, 16));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static std::vector<std::string> split_path_components(
+    const std::string &path) {
+  std::vector<std::string> comps;
+  std::string cur;
+  for (char ch : path) {
+    if (ch == '/') {
+      if (!cur.empty()) {
+        comps.push_back(cur);
+        cur.clear();
+      }
+    } else {
+      cur.push_back(ch);
+    }
+  }
+  if (!cur.empty()) comps.push_back(cur);
+  return comps;
+}
+
+static std::string derive_impl_from_trace_path(const std::string &trace_path) {
+  const std::vector<std::string> comps = split_path_components(trace_path);
+  if (comps.size() < 4) return "";
+  if (comps[comps.size() - 2] != "traces") return "";
+  return comps[comps.size() - 4];
+}
+
+static std::vector<loaded_ima_chain_row_t> load_ima_chain_rows(
+    const std::string &csv_path) {
+  std::vector<loaded_ima_chain_row_t> rows;
+  std::ifstream fin(csv_path.c_str());
+  if (!fin.is_open()) return rows;
+
+  std::string header_line;
+  if (!std::getline(fin, header_line)) return rows;
+  std::vector<std::string> header = split_csv_line(header_line);
+  std::map<std::string, size_t> cols;
+  for (size_t i = 0; i < header.size(); ++i) cols[header[i]] = i;
+
+  const bool has_kernel = cols.count("kernel") > 0;
+  const bool has_function = cols.count("function") > 0;
+  const bool has_impl = cols.count("impl") > 0;
+  const bool has_sm = cols.count("sm") > 0;
+  const bool has_classification = cols.count("classification") > 0;
+  const bool has_addr_pc = cols.count("addr_pc") > 0;
+  if (!cols.count("index_pc") || !cols.count("data_pc")) return rows;
+
+  std::string line;
+  while (std::getline(fin, line)) {
+    if (trim_copy(line).empty()) continue;
+    std::vector<std::string> fields = split_csv_line(line);
+    const size_t idx_pc_col = cols["index_pc"];
+    const size_t data_pc_col = cols["data_pc"];
+    if (idx_pc_col >= fields.size() || data_pc_col >= fields.size()) continue;
+
+    unsigned pc_idx = 0;
+    unsigned pc_data = 0;
+    if (!parse_hex_pc(fields[idx_pc_col], pc_idx) ||
+        !parse_hex_pc(fields[data_pc_col], pc_data))
+      continue;
+
+    loaded_ima_chain_row_t row;
+    row.pc_idx = pc_idx;
+    row.pc_data = pc_data;
+    if (has_kernel && cols["kernel"] < fields.size())
+      row.kernel = fields[cols["kernel"]];
+    if (has_function && cols["function"] < fields.size())
+      row.function = fields[cols["function"]];
+    if (has_impl && cols["impl"] < fields.size())
+      row.impl = fields[cols["impl"]];
+    if (has_sm && cols["sm"] < fields.size()) row.sm = fields[cols["sm"]];
+    if (has_classification && cols["classification"] < fields.size())
+      row.classification = fields[cols["classification"]];
+    if (has_addr_pc && cols["addr_pc"] < fields.size())
+      parse_hex_pc(fields[cols["addr_pc"]], row.pc_addr);
+    // P5: parse data source location for merge key
+    if (cols.count("data_source_file") && cols["data_source_file"] < fields.size())
+      row.data_source_file = fields[cols["data_source_file"]];
+    if (cols.count("data_source_line") && cols["data_source_line"] < fields.size())
+      row.data_source_line = fields[cols["data_source_line"]];
+    if (cols.count("stride_hint") && cols["stride_hint"] < fields.size()) {
+      try { row.stride_hint = std::stoi(fields[cols["stride_hint"]]); }
+      catch (...) { row.stride_hint = 0; }
+    }
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+static const std::vector<loaded_ima_chain_row_t> &get_ima_chain_rows(
+    const std::string &csv_path) {
+  static std::map<std::string, std::vector<loaded_ima_chain_row_t>> cache;
+  std::map<std::string, std::vector<loaded_ima_chain_row_t>>::iterator it =
+      cache.find(csv_path);
+  if (it == cache.end()) {
+    it = cache.insert(std::make_pair(csv_path, load_ima_chain_rows(csv_path)))
+             .first;
+  }
+  return it->second;
+}
+
+static std::vector<trace_shd_warp_t::ima_chain_desc_t> select_ima_chain_descs(
+    const std::string &csv_path, const std::string &kernel_name,
+    const std::string &sm_name, const std::string &trace_impl) {
+  const std::vector<loaded_ima_chain_row_t> &rows = get_ima_chain_rows(csv_path);
+  std::vector<loaded_ima_chain_row_t> filtered;
+  for (const loaded_ima_chain_row_t &row : rows) {
+    if (!row.kernel.empty() && row.kernel != kernel_name) continue;
+    if (!row.function.empty() && row.function != kernel_name) continue;
+    if (!trace_impl.empty() && !row.impl.empty() && row.impl != trace_impl) {
+      // Trace directory uses {algorithm}_{impl} convention (e.g., "bfs_linear_base")
+      // while CSV stores just impl (e.g., "linear_base"). Check suffix match.
+      std::string suffix = std::string("_") + row.impl;
+      if (trace_impl.length() < suffix.length() ||
+          trace_impl.compare(trace_impl.length() - suffix.length(),
+                             suffix.length(), suffix) != 0)
+        continue;
+    }
+    if (!sm_name.empty() && !row.sm.empty() && row.sm != sm_name) continue;
+    if (!row.classification.empty() && row.classification != "exact_chain")
+      continue;
+    filtered.push_back(row);
+  }
+
+  // P5: merge chains that share the same target array.
+  // Merge key = (data_source_file, data_source_line). Chains with the same
+  // data source location access the same array (e.g., x4 unrolled instances
+  // of column_indices[] in BFS). They share one addr_map so stride predictions
+  // across unrolled PCs can find each other's addresses.
+  // One-to-many chains (same index_pc, different data arrays) have different
+  // data source locations and remain separate.
+  //
+  // Fallback: if data_source_file is empty (old CSV format), don't merge —
+  // each (pc_idx, pc_data) pair gets its own table (v6 behavior).
+
+  std::set<std::pair<unsigned, unsigned>> seen_pairs;
+  // merge_key → index into result
+  std::map<std::string, unsigned> merge_groups;
+  std::vector<trace_shd_warp_t::ima_chain_desc_t> result;
+
+  for (const loaded_ima_chain_row_t &row : filtered) {
+    std::pair<unsigned, unsigned> key(row.pc_idx, row.pc_data);
+    if (!seen_pairs.insert(key).second) continue;
+
+    // Determine merge key
+    std::string merge_key;
+    if (!row.data_source_file.empty() && !row.data_source_line.empty()) {
+      merge_key = row.data_source_file + ":" + row.data_source_line;
+    }
+
+    if (!merge_key.empty() && merge_groups.count(merge_key)) {
+      // Merge into existing table
+      unsigned existing_idx = merge_groups[merge_key];
+      result[existing_idx].all_pc_pairs.push_back({row.pc_idx, row.pc_data});
+    } else {
+      // New table
+      trace_shd_warp_t::ima_chain_desc_t desc;
+      desc.chain_id = static_cast<unsigned>(result.size());
+      desc.pc_idx = row.pc_idx;
+      desc.pc_data = row.pc_data;
+      desc.all_pc_pairs.push_back({row.pc_idx, row.pc_data});
+      if (!merge_key.empty()) {
+        merge_groups[merge_key] = desc.chain_id;
+      }
+      result.push_back(desc);
+    }
+  }
+
+  // Build successor relationships (chain A's data_pc == chain B's index_pc)
+  for (size_t i = 0; i < result.size(); ++i) {
+    for (size_t j = 0; j < result.size(); ++j) {
+      if (i == j) continue;
+      // Check all data PCs of chain i against all index PCs of chain j
+      for (auto &pi : result[i].all_pc_pairs) {
+        for (auto &pj : result[j].all_pc_pairs) {
+          if (pi.second == pj.first) {
+            // Avoid duplicate successor entries
+            bool dup = false;
+            for (unsigned s : result[i].successor_chain_ids) {
+              if (s == result[j].chain_id) { dup = true; break; }
+            }
+            if (!dup) result[i].successor_chain_ids.push_back(result[j].chain_id);
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+}  // namespace
+
+const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst() {
+  if (trace_pc < warp_traces.size()) {
+    trace_warp_inst_t *new_inst =
+        new trace_warp_inst_t(get_shader()->get_config());
+    new_inst->parse_from_trace_struct(
+        warp_traces[trace_pc], m_kernel_info->OpcodeMap,
+        m_kernel_info->m_tconfig, m_kernel_info->m_kernel_trace_info);
+    trace_pc++;
+    return new_inst;
+  } else
+    return NULL;
+}
+
+void trace_shd_warp_t::clear() {
+  trace_pc = 0;
+  warp_traces.clear();
+  m_ima_pair_tables.clear();
+  m_chain_ids_by_pc.clear();
+  m_chain_ids_by_data_pc.clear();
+  m_pending_runtime_idx_occurrences.clear();
+  m_pending_runtime_verifications.clear();
+  m_runtime_idx_occurrence_counts.clear();
+  m_runtime_data_occurrence_counts.clear();
+  m_stat_runtime_verify_enqueued = 0;
+  m_stat_runtime_verify_duplicate = 0;
+  m_stat_runtime_verify_checked = 0;
+  m_stat_runtime_verify_matched = 0;
+  m_stat_runtime_verify_mismatched = 0;
+  m_stat_runtime_verify_no_prediction = 0;
+  m_stat_runtime_verify_missing_idx = 0;
+}
+
+// functional_done
+bool trace_shd_warp_t::trace_done() { return trace_pc == (warp_traces.size()); }
+
+address_type trace_shd_warp_t::get_start_trace_pc() {
+  assert(warp_traces.size() > 0);
+  return warp_traces[0].m_pc;
+}
+
+address_type trace_shd_warp_t::get_pc() {
+  assert(warp_traces.size() > 0);
+  assert(trace_pc < warp_traces.size());
+  return warp_traces[trace_pc].m_pc;
+}
+
+std::string trace_shd_warp_t::sm_name_for_current_kernel() const {
+  if (m_kernel_info == NULL) return "";
+  unsigned binary_version = m_kernel_info->get_trace_info()->binary_verion;
+  if (binary_version == AMPERE_RTX_BINART_VERSION ||
+      binary_version == AMPERE_A100_BINART_VERSION)
+    return "sm80";
+  if (binary_version == VOLTA_BINART_VERSION) return "sm70";
+  if (binary_version == PASCAL_P100_BINART_VERSION) return "sm60";
+  if (binary_version == PASCAL_TITANX_BINART_VERSION) return "sm61";
+  if (binary_version == TURING_BINART_VERSION) return "sm75";
+  if (binary_version == KEPLER_BINART_VERSION) return "sm35";
+  return "";
+}
+
+void trace_shd_warp_t::build_ima_pair_tables(const std::string &csv_path,
+                                             bool debug_enable) {
+  m_ima_pair_tables.clear();
+  m_chain_ids_by_pc.clear();
+  m_chain_ids_by_data_pc.clear();
+  m_pending_runtime_idx_occurrences.clear();
+  m_pending_runtime_verifications.clear();
+  m_runtime_idx_occurrence_counts.clear();
+  m_runtime_data_occurrence_counts.clear();
+  m_stat_runtime_verify_enqueued = 0;
+  m_stat_runtime_verify_duplicate = 0;
+  m_stat_runtime_verify_checked = 0;
+  m_stat_runtime_verify_matched = 0;
+  m_stat_runtime_verify_mismatched = 0;
+  m_stat_runtime_verify_no_prediction = 0;
+  m_stat_runtime_verify_missing_idx = 0;
+  if (csv_path.empty() || m_kernel_info == NULL) return;
+
+  const std::string kernel_name = m_kernel_info->get_trace_info()->kernel_name;
+  const std::string sm_name = sm_name_for_current_kernel();
+  const std::string trace_impl =
+      derive_impl_from_trace_path(m_kernel_info->get_trace_info()->trace_path);
+  std::vector<ima_chain_desc_t> descs =
+      select_ima_chain_descs(csv_path, kernel_name, sm_name, trace_impl);
+  if (descs.empty()) {
+    if (debug_enable) {
+      printf("IMA pair table: warp %u kernel '%s' impl '%s' found no chain specs "
+             "from %s\n",
+             get_warp_id(), kernel_name.c_str(), trace_impl.c_str(),
+             csv_path.c_str());
+    }
+    return;
+  }
+
+  m_ima_pair_tables.resize(descs.size());
+  m_pending_runtime_idx_occurrences.resize(descs.size());
+  m_pending_runtime_verifications.resize(descs.size());
+  m_runtime_idx_occurrence_counts.assign(descs.size(), 0);
+  m_runtime_data_occurrence_counts.assign(descs.size(), 0);
+  for (size_t i = 0; i < descs.size(); ++i) {
+    m_ima_pair_tables[i].desc = descs[i];
+    // P5: register ALL merged index/data PCs for this chain_id
+    for (auto &pp : descs[i].all_pc_pairs) {
+      m_chain_ids_by_pc[pp.first].push_back(descs[i].chain_id);
+      m_chain_ids_by_data_pc[pp.second].push_back(descs[i].chain_id);
+    }
+  }
+
+  // P5: build addr_map for each (possibly merged) table.
+  // A merged table has multiple (pc_idx, pc_data) pairs in all_pc_pairs.
+  // For each pair, scan the trace to match idx→data occurrences by order.
+  const new_addr_type kInvalidAddr = static_cast<new_addr_type>(-1);
+  for (ima_pair_chain_table_t &table : m_ima_pair_tables) {
+    // Build a set of all index/data PCs for fast lookup
+    std::set<unsigned> idx_pcs, data_pcs;
+    // Track per-(pc_idx, pc_data) pair occurrence counters
+    struct pair_state_t {
+      unsigned pc_idx, pc_data;
+      std::vector<std::vector<new_addr_type>> idx_occurrences;
+      unsigned idx_occ = 0, data_occ = 0;
+    };
+    std::vector<pair_state_t> pair_states;
+    for (auto &pp : table.desc.all_pc_pairs) {
+      pair_state_t ps;
+      ps.pc_idx = pp.first;
+      ps.pc_data = pp.second;
+      pair_states.push_back(ps);
+      idx_pcs.insert(pp.first);
+      data_pcs.insert(pp.second);
+    }
+
+    for (const inst_trace_t &inst : warp_traces) {
+      if (inst.memadd_info == NULL) continue;
+      std::bitset<WARP_SIZE> active_mask(inst.mask);
+
+      // Check each pair state
+      for (pair_state_t &ps : pair_states) {
+        if (inst.m_pc == ps.pc_idx) {
+          std::vector<new_addr_type> addrs(WARP_SIZE, kInvalidAddr);
+          for (unsigned lane = 0; lane < WARP_SIZE; ++lane) {
+            if (active_mask.test(lane))
+              addrs[lane] = inst.memadd_info->addrs[lane];
+          }
+          ps.idx_occurrences.push_back(addrs);
+          ++ps.idx_occ;
+        }
+        if (inst.m_pc == ps.pc_data) {
+          if (ps.data_occ >= ps.idx_occurrences.size()) continue;
+          const std::vector<new_addr_type> &idx_addrs =
+              ps.idx_occurrences[ps.data_occ];
+          for (unsigned lane = 0; lane < WARP_SIZE; ++lane) {
+            if (!active_mask.test(lane) || idx_addrs[lane] == kInvalidAddr)
+              continue;
+            new_addr_type idx_addr = idx_addrs[lane];
+            new_addr_type data_addr = inst.memadd_info->addrs[lane];
+            // Insert into the SHARED addr_map (merged across all pairs)
+            auto existing = table.addr_map.find(idx_addr);
+            if (existing == table.addr_map.end()) {
+              table.addr_map[idx_addr] = data_addr;
+              ++table.stat_build_pairs;
+            } else if (existing->second == data_addr) {
+              ++table.stat_duplicate_same_value;
+            } else {
+              // Conflict: same idx_addr maps to different data_addr.
+              // This can happen when merged chains access overlapping
+              // index ranges (e.g., x1 tail and x4 block share some elements).
+              // Keep the first mapping; log but don't assert.
+              ++table.stat_duplicate_conflict_value;
+            }
+          }
+          ++ps.data_occ;
+        }
+      }
+    }
+    if (debug_enable) {
+      printf("IMA pair table build: warp=%u chain=%u pc_idx=0x%04x "
+             "pc_data=0x%04x merged_pairs=%zu "
+             "pairs=%llu dup_same=%llu dup_conflict=%llu succ=%zu\n",
+             get_warp_id(), table.desc.chain_id, table.desc.pc_idx,
+             table.desc.pc_data, table.desc.all_pc_pairs.size(),
+             table.stat_build_pairs,
+             table.stat_duplicate_same_value,
+             table.stat_duplicate_conflict_value,
+             table.desc.successor_chain_ids.size());
+      printf("IMA pair table warp %u chain %u: addr_map_size=%zu\n",
+             get_warp_id(), table.desc.chain_id, table.addr_map.size());
+      // Dump addr_map keys for warp 0 (diagnostic)
+      if (get_warp_id() == 0 && !table.addr_map.empty()) {
+        printf("IMA_ADDR_MAP_DUMP: warp=0 chain=%u size=%zu keys=[",
+               table.desc.chain_id, table.addr_map.size());
+        bool first = true;
+        for (const auto &kv : table.addr_map) {
+          if (!first) printf(",");
+          printf("0x%llx", (unsigned long long)kv.first);
+          first = false;
+        }
+        printf("]\n");
+      }
+    }
+  }
+}
+
+void trace_shd_warp_t::merge_pair_tables_from(const trace_shd_warp_t &other) {
+  size_t n = std::min(m_ima_pair_tables.size(), other.m_ima_pair_tables.size());
+  for (size_t c = 0; c < n; ++c) {
+    for (auto &kv : other.m_ima_pair_tables[c].addr_map) {
+      m_ima_pair_tables[c].addr_map.insert(kv);  // first-wins on conflict
+    }
+  }
+  for (auto &kv : other.m_chain_ids_by_pc) {
+    auto &dst = m_chain_ids_by_pc[kv.first];
+    for (unsigned id : kv.second) {
+      if (std::find(dst.begin(), dst.end(), id) == dst.end())
+        dst.push_back(id);
+    }
+  }
+  for (auto &kv : other.m_chain_ids_by_data_pc) {
+    auto &dst = m_chain_ids_by_data_pc[kv.first];
+    for (unsigned id : kv.second) {
+      if (std::find(dst.begin(), dst.end(), id) == dst.end())
+        dst.push_back(id);
+    }
+  }
+}
+
+void trace_shd_warp_t::set_pair_tables(
+    const std::vector<ima_pair_chain_table_t> &tables,
+    const std::unordered_map<address_type, std::vector<unsigned>> &by_pc,
+    const std::unordered_map<address_type, std::vector<unsigned>> &by_data_pc) {
+  m_ima_pair_tables = tables;
+  m_chain_ids_by_pc = by_pc;
+  m_chain_ids_by_data_pc = by_data_pc;
+  // Reset runtime verification state for new tables
+  m_pending_runtime_idx_occurrences.resize(tables.size());
+  m_pending_runtime_verifications.resize(tables.size());
+  m_runtime_idx_occurrence_counts.assign(tables.size(), 0);
+  m_runtime_data_occurrence_counts.assign(tables.size(), 0);
+}
+
+std::vector<unsigned> trace_shd_warp_t::get_ima_seed_chain_ids(address_type pc) {
+  std::unordered_map<address_type, std::vector<unsigned>>::iterator it =
+      m_chain_ids_by_pc.find(pc);
+  if (it == m_chain_ids_by_pc.end()) return std::vector<unsigned>();
+  return it->second;
+}
+
+std::vector<ima_prefetch_candidate_t>
+trace_shd_warp_t::lookup_ima_prefetch_candidates(
+    new_addr_type request_addr, const std::vector<unsigned> &seed_chain_ids,
+    bool exact_match_only) {
+  std::vector<ima_prefetch_candidate_t> result;
+  if (seed_chain_ids.empty()) return result;
+
+  const new_addr_type sector_base =
+      request_addr - (request_addr % static_cast<new_addr_type>(SECTOR_SIZE));
+  std::set<std::tuple<unsigned, new_addr_type, new_addr_type>> dedupe;
+  for (unsigned chain_id : seed_chain_ids) {
+    if (chain_id >= m_ima_pair_tables.size()) continue;
+    ima_pair_chain_table_t &table = m_ima_pair_tables[chain_id];
+    bool chain_hit = false;
+    const unsigned slot_limit = exact_match_only ? 1 : (SECTOR_SIZE / 4);
+    for (unsigned slot = 0; slot < slot_limit; ++slot) {
+      new_addr_type idx_addr =
+          exact_match_only
+              ? request_addr
+              : (sector_base + static_cast<new_addr_type>(slot * sizeof(uint32_t)));
+      std::unordered_map<new_addr_type, new_addr_type>::iterator it =
+          table.addr_map.find(idx_addr);
+      if (it == table.addr_map.end()) continue;
+      chain_hit = true;
+      std::tuple<unsigned, new_addr_type, new_addr_type> dedupe_key(
+          chain_id, idx_addr, it->second);
+      if (!dedupe.insert(dedupe_key).second) continue;
+      ima_prefetch_candidate_t candidate;
+      candidate.idx_addr = idx_addr;
+      candidate.data_addr = it->second;
+      candidate.source_chain_id = chain_id;
+      candidate.successor_chain_ids = table.desc.successor_chain_ids;
+      result.push_back(candidate);
+    }
+    if (chain_hit)
+      ++table.stat_issue_lookup_hit;
+    else
+      ++table.stat_issue_lookup_miss;
+  }
+  return result;
+}
+
+void trace_shd_warp_t::record_ima_verify_predictions(
+    const std::vector<ima_prefetch_candidate_t> &cands,
+    unsigned long long issue_cycle, bool debug_enable, bool dedupe_pending) {
+  for (const ima_prefetch_candidate_t &cand : cands) {
+    if (cand.source_chain_id >= m_pending_runtime_verifications.size()) continue;
+    std::unordered_map<new_addr_type, std::deque<ima_runtime_verify_record_t>>
+        &by_idx = m_pending_runtime_verifications[cand.source_chain_id];
+    std::deque<ima_runtime_verify_record_t> &records = by_idx[cand.idx_addr];
+    if (dedupe_pending) {
+      bool duplicate_pending = false;
+      for (std::deque<ima_runtime_verify_record_t>::const_iterator it =
+               records.begin();
+           it != records.end(); ++it) {
+        if (it->predicted_data_addr == cand.data_addr) {
+          duplicate_pending = true;
+          break;
+        }
+      }
+      if (duplicate_pending) {
+        ++m_stat_runtime_verify_duplicate;
+        if (debug_enable) {
+          printf(
+              "IMA verify enqueue skip duplicate: warp=%u chain=%u idx=0x%llx "
+              "data=0x%llx cycle=%llu\n",
+              get_warp_id(), cand.source_chain_id,
+              (unsigned long long)cand.idx_addr,
+              (unsigned long long)cand.data_addr, issue_cycle);
+        }
+        continue;
+      }
+    }
+
+    ima_runtime_verify_record_t record;
+    record.chain_id = cand.source_chain_id;
+    record.idx_addr = cand.idx_addr;
+    record.predicted_data_addr = cand.data_addr;
+    record.issue_cycle = issue_cycle;
+    records.push_back(record);
+    ++m_stat_runtime_verify_enqueued;
+    if (debug_enable) {
+      printf(
+          "IMA verify enqueue: warp=%u chain=%u idx=0x%llx data=0x%llx "
+          "issue_cycle=%llu pending=%zu\n",
+          get_warp_id(), cand.source_chain_id,
+          (unsigned long long)cand.idx_addr,
+          (unsigned long long)cand.data_addr, issue_cycle, records.size());
+    }
+  }
+}
+
+void trace_shd_warp_t::observe_ima_runtime_memory_inst(const warp_inst_t &inst,
+                                                       unsigned long long cycle,
+                                                       bool debug_enable) {
+  if (m_ima_pair_tables.empty() || !inst.is_load()) return;
+
+  const new_addr_type kInvalidAddr = static_cast<new_addr_type>(-1);
+  const address_type pc = inst.pc;
+  std::vector<new_addr_type> lane_addrs(inst.warp_size(), kInvalidAddr);
+  bool has_active_lane = false;
+  for (unsigned lane = 0; lane < inst.warp_size(); ++lane) {
+    if (!inst.active(lane)) continue;
+    lane_addrs[lane] = inst.get_addr(lane);
+    has_active_lane = true;
+  }
+  if (!has_active_lane) return;
+
+  std::unordered_map<address_type, std::vector<unsigned>>::iterator idx_it =
+      m_chain_ids_by_pc.find(pc);
+  if (idx_it != m_chain_ids_by_pc.end()) {
+    for (unsigned chain_id : idx_it->second) {
+      if (chain_id >= m_pending_runtime_idx_occurrences.size()) continue;
+      ima_runtime_idx_occurrence_t occ;
+      occ.occurrence_id = ++m_runtime_idx_occurrence_counts[chain_id];
+      occ.idx_addrs = lane_addrs;
+      m_pending_runtime_idx_occurrences[chain_id].push_back(occ);
+      if (debug_enable) {
+        printf(
+            "IMA runtime idx observe: warp=%u chain=%u pc=0x%04llx occ=%llu "
+            "cycle=%llu\n",
+            get_warp_id(), chain_id, (unsigned long long)pc,
+            occ.occurrence_id, cycle);
+      }
+    }
+  }
+
+  std::unordered_map<address_type, std::vector<unsigned>>::iterator data_it =
+      m_chain_ids_by_data_pc.find(pc);
+  if (data_it == m_chain_ids_by_data_pc.end()) return;
+
+  for (unsigned chain_id : data_it->second) {
+    if (chain_id >= m_pending_runtime_idx_occurrences.size()) continue;
+    ++m_runtime_data_occurrence_counts[chain_id];
+    unsigned long long data_occ = m_runtime_data_occurrence_counts[chain_id];
+
+    std::deque<ima_runtime_idx_occurrence_t> &idx_queue =
+        m_pending_runtime_idx_occurrences[chain_id];
+    if (idx_queue.empty()) {
+      ++m_stat_runtime_verify_missing_idx;
+      if (debug_enable) {
+        printf(
+            "IMA runtime verify missing idx: warp=%u chain=%u pc=0x%04llx "
+            "data_occ=%llu cycle=%llu\n",
+            get_warp_id(), chain_id, (unsigned long long)pc, data_occ, cycle);
+      }
+      continue;
+    }
+
+    const ima_runtime_idx_occurrence_t idx_occ = idx_queue.front();
+    idx_queue.pop_front();
+    std::unordered_map<new_addr_type, std::deque<ima_runtime_verify_record_t>>
+        &verify_by_idx = m_pending_runtime_verifications[chain_id];
+
+    for (unsigned lane = 0; lane < inst.warp_size(); ++lane) {
+      if (!inst.active(lane)) continue;
+      const new_addr_type idx_addr = idx_occ.idx_addrs[lane];
+      if (idx_addr == kInvalidAddr) continue;
+      const new_addr_type actual_data_addr = lane_addrs[lane];
+      std::unordered_map<new_addr_type,
+                         std::deque<ima_runtime_verify_record_t>>::iterator rec_it =
+          verify_by_idx.find(idx_addr);
+      if (rec_it == verify_by_idx.end() || rec_it->second.empty()) {
+        ++m_stat_runtime_verify_no_prediction;
+        if (debug_enable) {
+          printf(
+              "IMA runtime verify no prediction: warp=%u chain=%u lane=%u "
+              "data_occ=%llu idx=0x%llx actual=0x%llx cycle=%llu\n",
+              get_warp_id(), chain_id, lane, data_occ,
+              (unsigned long long)idx_addr,
+              (unsigned long long)actual_data_addr, cycle);
+        }
+        continue;
+      }
+
+      ima_runtime_verify_record_t record = rec_it->second.front();
+      rec_it->second.pop_front();
+      if (rec_it->second.empty()) verify_by_idx.erase(rec_it);
+
+      ++m_stat_runtime_verify_checked;
+      if (record.predicted_data_addr == actual_data_addr) {
+        ++m_stat_runtime_verify_matched;
+        if (debug_enable) {
+          printf(
+              "IMA runtime verify match: warp=%u chain=%u lane=%u "
+              "idx_occ=%llu data_occ=%llu idx=0x%llx predicted=0x%llx "
+              "actual=0x%llx issue_cycle=%llu cycle=%llu\n",
+              get_warp_id(), chain_id, lane, idx_occ.occurrence_id, data_occ,
+              (unsigned long long)idx_addr,
+              (unsigned long long)record.predicted_data_addr,
+              (unsigned long long)actual_data_addr, record.issue_cycle, cycle);
+        }
+      } else {
+        ++m_stat_runtime_verify_mismatched;
+        printf(
+            "IMA runtime verify mismatch: warp=%u chain=%u lane=%u "
+            "idx_occ=%llu data_occ=%llu idx=0x%llx predicted=0x%llx "
+            "actual=0x%llx issue_cycle=%llu cycle=%llu\n",
+            get_warp_id(), chain_id, lane, idx_occ.occurrence_id, data_occ,
+            (unsigned long long)idx_addr,
+            (unsigned long long)record.predicted_data_addr,
+            (unsigned long long)actual_data_addr, record.issue_cycle, cycle);
+        if (debug_enable) {
+          assert(record.predicted_data_addr == actual_data_addr &&
+                 "IMA runtime verify mismatch");
+        }
+      }
+    }
+  }
+}
+
+trace_kernel_info_t::trace_kernel_info_t(dim3 gridDim, dim3 blockDim,
+                                         trace_function_info *m_function_info,
+                                         trace_parser *parser,
+                                         class trace_config *config,
+                                         kernel_trace_t *kernel_trace_info)
+    : kernel_info_t(gridDim, blockDim, m_function_info,
+                    kernel_trace_info->cuda_stream_id) {
+  m_parser = parser;
+  m_tconfig = config;
+  m_kernel_trace_info = kernel_trace_info;
+  m_was_launched = false;
+
+  // resolve the binary version
+  if (kernel_trace_info->binary_verion == AMPERE_RTX_BINART_VERSION ||
+      kernel_trace_info->binary_verion == AMPERE_A100_BINART_VERSION)
+    OpcodeMap = &Ampere_OpcodeMap;
+  else if (kernel_trace_info->binary_verion == VOLTA_BINART_VERSION)
+    OpcodeMap = &Volta_OpcodeMap;
+  else if (kernel_trace_info->binary_verion == PASCAL_TITANX_BINART_VERSION ||
+           kernel_trace_info->binary_verion == PASCAL_P100_BINART_VERSION)
+    OpcodeMap = &Pascal_OpcodeMap;
+  else if (kernel_trace_info->binary_verion == KEPLER_BINART_VERSION)
+    OpcodeMap = &Kepler_OpcodeMap;
+  else if (kernel_trace_info->binary_verion == TURING_BINART_VERSION)
+    OpcodeMap = &Turing_OpcodeMap;
+  else {
+    printf("unsupported binary version: %d\n",
+           kernel_trace_info->binary_verion);
+    fflush(stdout);
+    exit(0);
+  }
+}
+
+void trace_kernel_info_t::get_next_threadblock_traces(
+    std::vector<std::vector<inst_trace_t> *> threadblock_traces) {
+  m_parser->get_next_threadblock_traces(
+      threadblock_traces, m_kernel_trace_info->trace_verion,
+      m_kernel_trace_info->enable_lineinfo, m_kernel_trace_info->pipeReader);
+}
+
+void trace_kernel_info_t::build_kernel_pair_tables(
+    const std::string &csv_path, unsigned warps_per_cta, bool debug_enable) {
+  if (m_kernel_pair_tables_built) return;
+
+  // Open a separate PipeReader and skip the header.
+  // Header format: lines starting with '-' (metadata), then '#traces format',
+  // then empty lines, then '#BEGIN_TB'. parse_kernel_info reads '-' lines and
+  // breaks on '#', leaving the pipe at '#BEGIN_TB'. We replicate that logic.
+  kernel_trace_t scan_trace(m_kernel_trace_info->trace_path);
+  {
+    std::string line;
+    while (scan_trace.pipeReader.readLine(line)) {
+      if (line.empty()) continue;
+      if (line[0] == '#') break;  // consumed '#traces format', now at #BEGIN_TB
+      // lines starting with '-' are header fields, skip them
+    }
+  }
+
+  unsigned total_ctas = m_kernel_trace_info->grid_dim_x *
+                        m_kernel_trace_info->grid_dim_y *
+                        m_kernel_trace_info->grid_dim_z;
+  bool first_warp = true;
+
+  for (unsigned cta = 0; cta < total_ctas; ++cta) {
+    std::vector<std::vector<inst_trace_t>> temp_traces(warps_per_cta);
+    std::vector<std::vector<inst_trace_t> *> ptrs;
+    for (unsigned w = 0; w < warps_per_cta; ++w)
+      ptrs.push_back(&temp_traces[w]);
+
+    m_parser->get_next_threadblock_traces(
+        ptrs, m_kernel_trace_info->trace_verion,
+        m_kernel_trace_info->enable_lineinfo, scan_trace.pipeReader);
+
+    for (unsigned w = 0; w < warps_per_cta; ++w) {
+      if (temp_traces[w].empty()) continue;
+
+      // Build per-warp pair tables using existing logic
+      trace_shd_warp_t temp_warp(nullptr, 32);
+      temp_warp.warp_traces = std::move(temp_traces[w]);
+      temp_warp.set_kernel(this);
+      temp_warp.build_ima_pair_tables(csv_path, false);
+
+      const auto &warp_tables = temp_warp.get_pair_tables();
+      if (first_warp && !warp_tables.empty()) {
+        // Initialize kernel-level from first warp's chain structure
+        m_kernel_pair_chains.resize(warp_tables.size());
+        for (size_t c = 0; c < warp_tables.size(); ++c) {
+          m_kernel_pair_chains[c].addr_map = warp_tables[c].addr_map;
+        }
+        m_kernel_chain_ids_by_pc = temp_warp.get_chain_ids_by_pc();
+        m_kernel_chain_ids_by_data_pc = temp_warp.get_chain_ids_by_data_pc();
+        first_warp = false;
+      } else {
+        // Merge this warp's addr_maps into the kernel-level tables
+        size_t n = std::min(m_kernel_pair_chains.size(), warp_tables.size());
+        for (size_t c = 0; c < n; ++c) {
+          for (auto &kv : warp_tables[c].addr_map) {
+            m_kernel_pair_chains[c].addr_map.insert(kv);
+          }
+        }
+      }
+    }
+  }
+
+  m_kernel_pair_tables_built = true;
+  if (debug_enable) {
+    printf("IMA kernel-level pair tables: %zu chains, CTAs=%u\n",
+           m_kernel_pair_chains.size(), total_ctas);
+    for (size_t c = 0; c < m_kernel_pair_chains.size(); ++c) {
+      printf("  chain %zu: addr_map_size=%zu\n", c,
+             m_kernel_pair_chains[c].addr_map.size());
+    }
+  }
+}
+
+types_of_operands get_oprnd_type(op_type op, special_ops sp_op) {
+  switch (op) {
+    case SP_OP:
+    case SFU_OP:
+    case SPECIALIZED_UNIT_2_OP:
+    case SPECIALIZED_UNIT_3_OP:
+    case DP_OP:
+    case LOAD_OP:
+    case STORE_OP:
+      return FP_OP;
+    case INTP_OP:
+    case SPECIALIZED_UNIT_4_OP:
+      return INT_OP;
+    case ALU_OP:
+      if ((sp_op == FP__OP) || (sp_op == TEX__OP) || (sp_op == OTHER_OP))
+        return FP_OP;
+      else if (sp_op == INT__OP)
+        return INT_OP;
+    default:
+      return UN_OP;
+  }
+}
+
+bool trace_warp_inst_t::parse_from_trace_struct(
+    const inst_trace_t &trace,
+    const std::unordered_map<std::string, OpcodeChar> *OpcodeMap,
+    const class trace_config *tconfig,
+    const class kernel_trace_t *kernel_trace_info) {
+  // fill the inst_t and warp_inst_t params
+
+  // fill active mask
+  active_mask_t active_mask = trace.mask;
+  set_active(active_mask);
+
+  // fill and initialize common params
+  m_decoded = true;
+  pc = (address_type)trace.m_pc;
+
+  isize =
+      16;  // starting from MAXWELL isize=16 bytes (including the control bytes)
+  for (unsigned i = 0; i < MAX_OUTPUT_VALUES; i++) {
+    out[i] = 0;
+  }
+  for (unsigned i = 0; i < MAX_INPUT_VALUES; i++) {
+    in[i] = 0;
+  }
+
+  is_vectorin = 0;
+  is_vectorout = 0;
+  pred = 0;
+  ar1 = 0;
+  ar2 = 0;
+  memory_op = no_memory_op;
+  data_size = 0;
+  op = ALU_OP;
+  sp_op = OTHER_OP;
+  mem_op = NOT_TEX;
+  const_cache_operand = 0;
+  oprnd_type = UN_OP;
+
+  // get the opcode
+  m_sass_opcode = trace.opcode;  // P4: save full SASS mnemonic for GRASP CD
+  std::vector<std::string> opcode_tokens = trace.get_opcode_tokens();
+  std::string opcode1 = opcode_tokens[0];
+
+  std::unordered_map<std::string, OpcodeChar>::const_iterator it =
+      OpcodeMap->find(opcode1);
+  if (it != OpcodeMap->end()) {
+    m_opcode = it->second.opcode;
+    op = (op_type)(it->second.opcode_category);
+    const std::unordered_map<unsigned, unsigned> *OpcPowerMap = &OpcodePowerMap;
+    std::unordered_map<unsigned, unsigned>::const_iterator it2 =
+        OpcPowerMap->find(m_opcode);
+    if (it2 != OpcPowerMap->end()) sp_op = (special_ops)(it2->second);
+    oprnd_type = get_oprnd_type(op, sp_op);
+  } else {
+    std::cout << "ERROR:  undefined instruction : " << trace.opcode
+              << " Opcode: " << opcode1 << std::endl;
+    assert(0 && "undefined instruction");
+  }
+  std::string opcode = trace.opcode;
+  if (opcode1 == "MUFU") {  // Differentiate between different MUFU operations
+                            // for power model
+    if ((opcode == "MUFU.SIN") || (opcode == "MUFU.COS")) sp_op = FP_SIN_OP;
+    if ((opcode == "MUFU.EX2") || (opcode == "MUFU.RCP")) sp_op = FP_EXP_OP;
+    if (opcode == "MUFU.RSQ") sp_op = FP_SQRT_OP;
+    if (opcode == "MUFU.LG2") sp_op = FP_LG_OP;
+  }
+
+  if (opcode1 == "IMAD") {  // Differentiate between different IMAD operations
+                            // for power model
+    if ((opcode == "IMAD.MOV") || (opcode == "IMAD.IADD")) sp_op = INT__OP;
+  }
+
+  // fill regs information
+  num_regs = trace.reg_srcs_num + trace.reg_dsts_num;
+  num_operands = num_regs;
+  outcount = trace.reg_dsts_num;
+  for (unsigned m = 0; m < trace.reg_dsts_num; ++m) {
+    out[m] =
+        trace.reg_dest[m] + 1;  // Increment by one because GPGPU-sim starts
+                                // from R1, while SASS starts from R0
+    arch_reg.dst[m] = trace.reg_dest[m] + 1;
+  }
+
+  incount = trace.reg_srcs_num;
+  for (unsigned m = 0; m < trace.reg_srcs_num; ++m) {
+    in[m] = trace.reg_src[m] + 1;  // Increment by one because GPGPU-sim starts
+                                   // from R1, while SASS starts from R0
+    arch_reg.src[m] = trace.reg_src[m] + 1;
+  }
+
+  // fill latency and initl
+  tconfig->set_latency(op, latency, initiation_interval);
+
+  // fill addresses
+  if (trace.memadd_info != NULL) {
+    data_size = trace.memadd_info->width;
+    for (unsigned i = 0; i < warp_size(); ++i)
+      set_addr(i, trace.memadd_info->addrs[i]);
+  }
+
+  // handle special cases and fill memory space
+  switch (m_opcode) {
+    case OP_LDC:  // handle Load from Constant
+      data_size = 4;
+      memory_op = memory_load;
+      const_cache_operand = 1;
+      space.set_type(const_space);
+      cache_op = CACHE_ALL;
+      break;
+    case OP_LDG:
+    // LDGSTS is loading the values needed directly from the global memory to
+    // shared memory. Before this feature, the values need to be loaded to
+    // registers first, then store to the shared memory.
+    case OP_LDGSTS:  // Add for memcpy_async
+    case OP_LDL:
+      assert(data_size > 0);
+      memory_op = memory_load;
+      cache_op = CACHE_ALL;
+      if (m_opcode == OP_LDL)
+        space.set_type(local_space);
+      else
+        space.set_type(global_space);
+      // Add for LDGSTS instruction
+      if (m_opcode == OP_LDGSTS) m_is_ldgsts = true;
+      // check the cache scope, if its strong GPU, then bypass L1
+      if ((trace.check_opcode_contain(opcode_tokens, "STRONG") &&
+           trace.check_opcode_contain(opcode_tokens, "GPU")) ||
+          trace.check_opcode_contain(opcode_tokens, "BYPASS")) {
+        cache_op = CACHE_GLOBAL;
+      }
+      break;
+    case OP_STG:
+    case OP_STL:
+      assert(data_size > 0);
+      memory_op = memory_store;
+      cache_op = CACHE_ALL;
+      if (m_opcode == OP_STL)
+        space.set_type(local_space);
+      else
+        space.set_type(global_space);
+      break;
+    case OP_ATOMG:
+    case OP_RED:
+    case OP_ATOM:
+      assert(data_size > 0);
+      memory_op = memory_load;
+      op = LOAD_OP;
+      space.set_type(global_space);
+      m_isatomic = true;
+      cache_op = CACHE_GLOBAL;  // all the atomics should be done at L2
+      break;
+    case OP_LDS:
+      assert(data_size > 0);
+      memory_op = memory_load;
+      space.set_type(shared_space);
+      break;
+    case OP_STS:
+      assert(data_size > 0);
+      memory_op = memory_store;
+      space.set_type(shared_space);
+      break;
+    case OP_ATOMS:
+      assert(data_size > 0);
+      m_isatomic = true;
+      memory_op = memory_load;
+      space.set_type(shared_space);
+      break;
+    case OP_LDSM:
+      assert(data_size > 0);
+      space.set_type(shared_space);
+      break;
+    case OP_ST:
+    case OP_LD:
+      assert(data_size > 0);
+      if (m_opcode == OP_LD)
+        memory_op = memory_load;
+      else
+        memory_op = memory_store;
+      // resolve generic loads
+      if (kernel_trace_info->shmem_base_addr == 0 ||
+          kernel_trace_info->local_base_addr == 0) {
+        // shmem and local addresses are not set
+        // assume all the mem reqs are shared by default
+        space.set_type(shared_space);
+      } else {
+        // check the first active address
+        for (unsigned i = 0; i < warp_size(); ++i)
+          if (active_mask.test(i)) {
+            if (trace.memadd_info->addrs[i] >=
+                    kernel_trace_info->shmem_base_addr &&
+                trace.memadd_info->addrs[i] <
+                    kernel_trace_info->local_base_addr)
+              space.set_type(shared_space);
+            else if (trace.memadd_info->addrs[i] >=
+                         kernel_trace_info->local_base_addr &&
+                     trace.memadd_info->addrs[i] <
+                         kernel_trace_info->local_base_addr +
+                             LOCAL_MEM_SIZE_MAX) {
+              space.set_type(local_space);
+              cache_op = CACHE_ALL;
+            } else {
+              space.set_type(global_space);
+              cache_op = CACHE_ALL;
+            }
+            break;
+          }
+      }
+
+      break;
+    case OP_BAR:
+      // TO DO: fill this correctly
+      bar_id = 0;
+      bar_count = (unsigned)-1;
+      bar_type = SYNC;
+      // TO DO
+      // if bar_type = RED;
+      // set bar_type
+      // barrier_type bar_type;
+      // reduction_type red_type;
+      break;
+    // LDGDEPBAR is to form a group containing the previous LDGSTS instructions
+    // that have not been grouped yet. In the implementation, a group number
+    // will be assigned once the instruction is met.
+    case OP_LDGDEPBAR:
+      m_is_ldgdepbar = true;
+      break;
+    // DEPBAR is served as a warp-wise barrier that is only effective for LDGSTS
+    // instructions. It is associated with a immediate value. The immediate
+    // value indicates the last N LDGDEPBAR groups to not wait once the
+    // instruction is met. For example, if the immediate value is 1, then the
+    // last group is able to proceed even with DEPBAR present; if the immediate
+    // value is 0, then all of the groups need to finish before proceed.
+    case OP_DEPBAR:
+      m_is_depbar = true;
+      m_depbar_group_no = trace.imm;
+      break;
+    case OP_HADD2:
+    case OP_HADD2_32I:
+    case OP_HFMA2:
+    case OP_HFMA2_32I:
+    case OP_HMUL2_32I:
+    case OP_HSET2:
+    case OP_HSETP2:
+      initiation_interval =
+          initiation_interval / 2;  // FP16 has 2X throughput than FP32
+      if (initiation_interval <
+          1)  // Make sure initiaion interval never goes below 1
+        initiation_interval = 1;
+      break;
+    default:
+      break;
+  }
+
+  return true;
+}
+
+trace_config::trace_config() {}
+
+void trace_config::reg_options(option_parser_t opp) {
+  option_parser_register(opp, "-trace", OPT_CSTR, &g_traces_filename,
+                         "traces kernel file"
+                         "traces kernel file directory",
+                         "./traces/kernelslist.g");
+
+  option_parser_register(opp, "-trace_opcode_latency_initiation_int", OPT_CSTR,
+                         &trace_opcode_latency_initiation_int,
+                         "Opcode latencies and initiation for integers in "
+                         "trace driven mode <latency,initiation>",
+                         "4,1");
+  option_parser_register(opp, "-trace_opcode_latency_initiation_sp", OPT_CSTR,
+                         &trace_opcode_latency_initiation_sp,
+                         "Opcode latencies and initiation for sp in trace "
+                         "driven mode <latency,initiation>",
+                         "4,1");
+  option_parser_register(opp, "-trace_opcode_latency_initiation_dp", OPT_CSTR,
+                         &trace_opcode_latency_initiation_dp,
+                         "Opcode latencies and initiation for dp in trace "
+                         "driven mode <latency,initiation>",
+                         "4,1");
+  option_parser_register(opp, "-trace_opcode_latency_initiation_sfu", OPT_CSTR,
+                         &trace_opcode_latency_initiation_sfu,
+                         "Opcode latencies and initiation for sfu in trace "
+                         "driven mode <latency,initiation>",
+                         "4,1");
+  option_parser_register(opp, "-trace_opcode_latency_initiation_tensor",
+                         OPT_CSTR, &trace_opcode_latency_initiation_tensor,
+                         "Opcode latencies and initiation for tensor in trace "
+                         "driven mode <latency,initiation>",
+                         "4,1");
+
+  for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
+    std::stringstream ss;
+    ss << "-trace_opcode_latency_initiation_spec_op_" << j + 1;
+    option_parser_register(opp, ss.str().c_str(), OPT_CSTR,
+                           &trace_opcode_latency_initiation_specialized_op[j],
+                           "specialized unit config"
+                           " <latency,initiation>",
+                           "4,4");
+  }
+}
+
+void trace_config::parse_config() {
+  sscanf(trace_opcode_latency_initiation_int, "%u,%u", &int_latency, &int_init);
+  sscanf(trace_opcode_latency_initiation_sp, "%u,%u", &fp_latency, &fp_init);
+  sscanf(trace_opcode_latency_initiation_dp, "%u,%u", &dp_latency, &dp_init);
+  sscanf(trace_opcode_latency_initiation_sfu, "%u,%u", &sfu_latency, &sfu_init);
+  sscanf(trace_opcode_latency_initiation_tensor, "%u,%u", &tensor_latency,
+         &tensor_init);
+
+  for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
+    sscanf(trace_opcode_latency_initiation_specialized_op[j], "%u,%u",
+           &specialized_unit_latency[j], &specialized_unit_initiation[j]);
+  }
+}
+void trace_config::set_latency(unsigned category, unsigned &latency,
+                               unsigned &initiation_interval) const {
+  initiation_interval = latency = 1;
+
+  switch (category) {
+    case ALU_OP:
+    case INTP_OP:
+    case BRANCH_OP:
+    case CALL_OPS:
+    case RET_OPS:
+      latency = int_latency;
+      initiation_interval = int_init;
+      break;
+    case SP_OP:
+      latency = fp_latency;
+      initiation_interval = fp_init;
+      break;
+    case DP_OP:
+      latency = dp_latency;
+      initiation_interval = dp_init;
+      break;
+    case SFU_OP:
+      latency = sfu_latency;
+      initiation_interval = sfu_init;
+      break;
+    case TENSOR_CORE_OP:
+      latency = tensor_latency;
+      initiation_interval = tensor_init;
+      break;
+    default:
+      break;
+  }
+  // for specialized units
+  if (category >= SPEC_UNIT_START_ID) {
+    unsigned spec_id = category - SPEC_UNIT_START_ID;
+    assert(spec_id >= 0 && spec_id < SPECIALIZED_UNIT_NUM);
+    latency = specialized_unit_latency[spec_id];
+    initiation_interval = specialized_unit_initiation[spec_id];
+  }
+}
+
+void trace_gpgpu_sim::createSIMTCluster() {
+  m_cluster = new simt_core_cluster *[m_shader_config->n_simt_clusters];
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i] =
+        new trace_simt_core_cluster(this, i, m_shader_config, m_memory_config,
+                                    m_shader_stats, m_memory_stats);
+}
+
+void trace_simt_core_cluster::create_shader_core_ctx() {
+  m_core = new shader_core_ctx *[m_config->n_simt_cores_per_cluster];
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
+    unsigned sid = m_config->cid_to_sid(i, m_cluster_id);
+    m_core[i] = new trace_shader_core_ctx(m_gpu, this, sid, m_cluster_id,
+                                          m_config, m_mem_config, m_stats);
+    m_core_sim_order.push_back(i);
+  }
+}
+
+void trace_shader_core_ctx::create_shd_warp() {
+  m_warp.resize(m_config->max_warps_per_shader);
+  for (unsigned k = 0; k < m_config->max_warps_per_shader; ++k) {
+    m_warp[k] = new trace_shd_warp_t(this, m_config->warp_size);
+  }
+}
+
+void trace_shader_core_ctx::get_pdom_stack_top_info(unsigned warp_id,
+                                                    const warp_inst_t *pI,
+                                                    unsigned *pc,
+                                                    unsigned *rpc) {
+  // In trace-driven mode, we assume no control hazard
+  assert(pI != NULL && "Unexpexted behaviour , inst should not be null");
+  *pc = pI->pc;
+  *rpc = pI->pc;
+}
+
+const active_mask_t &trace_shader_core_ctx::get_active_mask(
+    unsigned warp_id, const warp_inst_t *pI) {
+  // For Trace-driven, the active mask already set in traces, so
+  // just read it from the inst
+  return pI->get_active_mask();
+}
+
+unsigned trace_shader_core_ctx::sim_init_thread(
+    kernel_info_t &kernel, ptx_thread_info **thread_info, int sid, unsigned tid,
+    unsigned threads_left, unsigned num_threads, core_t *core,
+    unsigned hw_cta_id, unsigned hw_warp_id, gpgpu_t *gpu) {
+  if (kernel.no_more_ctas_to_run()) {
+    return 0;  // finished!
+  }
+
+  if (kernel.more_threads_in_cta()) {
+    kernel.increment_thread_id();
+  }
+
+  if (!kernel.more_threads_in_cta()) kernel.increment_cta_id();
+
+  return 1;
+}
+
+void trace_shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
+                                       unsigned end_thread, unsigned ctaid,
+                                       int cta_size, kernel_info_t &kernel) {
+  // call base class
+  shader_core_ctx::init_warps(cta_id, start_thread, end_thread, ctaid, cta_size,
+                              kernel);
+
+  // then init traces
+  unsigned start_warp = start_thread / m_config->warp_size;
+  unsigned end_warp = end_thread / m_config->warp_size +
+                      ((end_thread % m_config->warp_size) ? 1 : 0);
+
+  init_traces(start_warp, end_warp, kernel);
+}
+
+const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
+                                                        address_type pc) {
+  // read the inst from the traces
+  trace_shd_warp_t *m_trace_warp =
+      static_cast<trace_shd_warp_t *>(m_warp[warp_id]);
+  const trace_warp_inst_t *ret = m_trace_warp->get_next_trace_inst();
+  if (ret == NULL && m_trace_warp->trace_done()) {
+    if (!m_warp[warp_id]->inst_in_pipeline() &&
+        m_warp[warp_id]->stores_done() &&
+        !m_warp[warp_id]->done_exit() &&
+        !m_scoreboard->pendingWrites(warp_id)) {
+      unsigned cta_id = m_warp[warp_id]->get_cta_id();
+      for (unsigned t = 0; t < m_warp_size; t++) {
+        if (m_warp[warp_id]->test_active(t)) {
+          m_warp[warp_id]->set_completed(t);
+        }
+      }
+      m_barriers.warp_exit(warp_id);
+      bool did_exit = false;
+      for (unsigned t = 0; t < m_warp_size; t++) {
+        unsigned tid = warp_id * m_warp_size + t;
+        if (m_threadState[tid].m_active == true) {
+          m_threadState[tid].m_active = false;
+          if (m_thread[tid] == NULL) {
+            register_cta_thread_exit(cta_id, m_warp[warp_id]->get_kernel_info());
+          } else {
+            register_cta_thread_exit(cta_id, &(m_thread[tid]->get_kernel()));
+          }
+          m_not_completed -= 1;
+          m_active_threads.reset(tid);
+          did_exit = true;
+        }
+      }
+      if (did_exit) {
+        m_warp[warp_id]->set_done_exit();
+        // Hook 7: GRASP warp exit — clean tracked warp state
+        // (mirrors the execution-driven path in shader.cc)
+        if (m_ldst_unit->grasp_enabled()) {
+          m_ldst_unit->grasp()->on_warp_exit(warp_id);
+        }
+        --m_active_warps;
+        assert(m_active_warps >= 0);
+      }
+    }
+  }
+  return ret;
+}
+
+void trace_shader_core_ctx::updateSIMTStack(unsigned warpId,
+                                            warp_inst_t *inst) {
+  // No SIMT-stack in trace-driven  mode
+}
+
+void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
+                                        kernel_info_t &kernel) {
+  std::vector<std::vector<inst_trace_t> *> threadblock_traces;
+  for (unsigned i = start_warp; i < end_warp; ++i) {
+    trace_shd_warp_t *m_trace_warp = static_cast<trace_shd_warp_t *>(m_warp[i]);
+    m_trace_warp->clear();
+    threadblock_traces.push_back(&(m_trace_warp->warp_traces));
+  }
+  trace_kernel_info_t &trace_kernel =
+      static_cast<trace_kernel_info_t &>(kernel);
+  trace_kernel.get_next_threadblock_traces(threadblock_traces);
+
+  // set the pc from the traces and ignore the functional model
+  const bool has_csv = m_config->gpgpu_ima_prefetch_chain_csv != NULL &&
+                       strlen(m_config->gpgpu_ima_prefetch_chain_csv) > 0;
+  const std::string csv_path =
+      has_csv ? std::string(m_config->gpgpu_ima_prefetch_chain_csv) : "";
+  const bool debug =
+      m_config->gpgpu_ima_prefetch_debug || m_config->grasp_debug;
+  const unsigned pt_scope = m_config->grasp_pair_table_scope;
+
+  for (unsigned i = start_warp; i < end_warp; ++i) {
+    trace_shd_warp_t *m_trace_warp = static_cast<trace_shd_warp_t *>(m_warp[i]);
+    if (!m_trace_warp->warp_traces.empty()) {
+      m_trace_warp->set_next_pc(m_trace_warp->get_start_trace_pc());
+    }
+    m_trace_warp->set_kernel(&trace_kernel);
+  }
+
+  if (!has_csv) return;
+
+  if (pt_scope == 2) {
+    // === Per-kernel: build once from entire trace file, share with all CTAs ===
+    unsigned warps_per_cta = end_warp - start_warp;
+    if (!trace_kernel.m_kernel_pair_tables_built) {
+      trace_kernel.build_kernel_pair_tables(csv_path, warps_per_cta, debug);
+    }
+    // Build per-warp tables first (for chain structure and PC indices),
+    // then replace each chain's addr_map with the kernel-level merged map.
+    for (unsigned i = start_warp; i < end_warp; ++i) {
+      auto *w = static_cast<trace_shd_warp_t *>(m_warp[i]);
+      w->build_ima_pair_tables(csv_path, false);
+      // Overwrite addr_maps with kernel-level merged maps
+      auto &warp_tables = w->get_pair_tables_mut();
+      size_t n = std::min(warp_tables.size(),
+                          trace_kernel.m_kernel_pair_chains.size());
+      for (size_t c = 0; c < n; ++c) {
+        warp_tables[c].addr_map = trace_kernel.m_kernel_pair_chains[c].addr_map;
+      }
+      // Also update PC indices from kernel-level
+      w->set_chain_ids(trace_kernel.m_kernel_chain_ids_by_pc,
+                       trace_kernel.m_kernel_chain_ids_by_data_pc);
+    }
+  } else {
+    // === Per-warp build (used for scope=0 and as basis for scope=1) ===
+    for (unsigned i = start_warp; i < end_warp; ++i) {
+      auto *w = static_cast<trace_shd_warp_t *>(m_warp[i]);
+      w->build_ima_pair_tables(csv_path, debug);
+    }
+
+    if (pt_scope == 1 && end_warp - start_warp > 1) {
+      // === Per-CTA: merge all warps' tables, then copy back ===
+      auto *warp0 = static_cast<trace_shd_warp_t *>(m_warp[start_warp]);
+      for (unsigned i = start_warp + 1; i < end_warp; ++i) {
+        auto *w = static_cast<trace_shd_warp_t *>(m_warp[i]);
+        warp0->merge_pair_tables_from(*w);
+      }
+      for (unsigned i = start_warp + 1; i < end_warp; ++i) {
+        auto *w = static_cast<trace_shd_warp_t *>(m_warp[i]);
+        w->set_pair_tables(warp0->get_pair_tables(),
+                           warp0->get_chain_ids_by_pc(),
+                           warp0->get_chain_ids_by_data_pc());
+      }
+    }
+  }
+
+  // === Pair table CSV dump (after scope merge) ===
+  const char *dump_path = m_config->grasp_pair_table_dump_path;
+  if (dump_path && dump_path[0] != '\0') {
+    static bool s_pt_dump_header = false;
+    FILE *fp = fopen(dump_path, s_pt_dump_header ? "a" : "w");
+    if (fp) {
+      if (!s_pt_dump_header) {
+        fprintf(fp,
+                "kernel_id,cta_id,warp_id,chain_id,idx_pc,data_pc,"
+                "idx_addr,data_addr\n");
+        s_pt_dump_header = true;
+      }
+      unsigned kernel_uid = kernel.get_uid();
+      unsigned cta_id_val = m_warp[start_warp]->get_cta_id();
+      for (unsigned i = start_warp; i < end_warp; ++i) {
+        auto *w = static_cast<trace_shd_warp_t *>(m_warp[i]);
+        const auto &tables = w->get_pair_tables();
+        for (size_t c = 0; c < tables.size(); ++c) {
+          const auto &table = tables[c];
+          for (const auto &kv : table.addr_map) {
+            fprintf(fp, "%u,%u,%u,%u,0x%x,0x%x,0x%llx,0x%llx\n",
+                    kernel_uid, cta_id_val, w->get_warp_id(),
+                    table.desc.chain_id, table.desc.pc_idx,
+                    table.desc.pc_data, (unsigned long long)kv.first,
+                    (unsigned long long)kv.second);
+          }
+        }
+        // For scope=1/2, all warps share the same table — dump first only
+        if (pt_scope > 0) break;
+      }
+      fclose(fp);
+    }
+  }
+}
+
+void trace_shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
+                                                          unsigned t,
+                                                          unsigned tid) {
+  if (inst.isatomic()) m_warp[inst.warp_id()]->inc_n_atomic();
+
+  if (inst.space.is_local() && (inst.is_load() || inst.is_store())) {
+    new_addr_type localaddrs[MAX_ACCESSES_PER_INSN_PER_THREAD];
+    unsigned num_addrs;
+    num_addrs = translate_local_memaddr(
+        inst.get_addr(t), tid,
+        m_config->n_simt_clusters * m_config->n_simt_cores_per_cluster,
+        inst.data_size, (new_addr_type *)localaddrs);
+    inst.set_addr(t, (new_addr_type *)localaddrs, num_addrs);
+  }
+}
+
+void trace_shader_core_ctx::func_exec_inst(warp_inst_t &inst) {
+  for (unsigned t = 0; t < m_warp_size; t++) {
+    if (inst.active(t)) {
+      unsigned warpId = inst.warp_id();
+      unsigned tid = m_warp_size * warpId + t;
+
+      // virtual function
+      checkExecutionStatusAndUpdate(inst, t, tid);
+    }
+  }
+  // here, we generate memory acessess and set the status if thread (done?)
+  if (inst.is_load() || inst.is_store()) {
+    inst.generate_mem_accesses();
+    if (m_config->gpgpu_ima_prefetch_enable) {
+      trace_shd_warp_t *trace_warp =
+          static_cast<trace_shd_warp_t *>(m_warp[inst.warp_id()]);
+      unsigned long long cycle =
+          m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;
+      trace_warp->observe_ima_runtime_memory_inst(
+          inst, cycle, m_config->gpgpu_ima_prefetch_debug);
+    }
+  }
+}
+
+void trace_shader_core_ctx::issue_warp(register_set &warp,
+                                       const warp_inst_t *pI,
+                                       const active_mask_t &active_mask,
+                                       unsigned warp_id, unsigned sch_id) {
+  shader_core_ctx::issue_warp(warp, pI, active_mask, warp_id, sch_id);
+
+  // delete warp_inst_t class here, it is not required anymore by gpgpu-sim
+  // after issue
+  delete pI;
+}

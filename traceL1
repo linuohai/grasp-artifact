@@ -1,0 +1,1732 @@
+#!/bin/bash
+
+# Accel-Sim run script, supports trace switching and automatic CSV filename updates
+
+# Get the script's directory as the base path
+BASE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+# Default configuration
+CONFIG_MODEL="SM80_A100"
+NLEVEL_ENABLED=false
+GTO_ENABLED=false
+NLEVEL_DEFAULT_SCHEDULER="lrr"
+PLOT_TMUX_ENABLED=false
+PLOT_ENABLED=false
+PLOT_BACKEND="local"     # session|local
+PLOT_BACKGROUND=false    # local backend only
+PLOT_FORMAT="svg"
+PLOT_SESSION=""
+PLOT_ATTACH=false
+PLOT_KILL_EXISTING=false
+PLOT_TMUX_AUTO_CLOSE=false
+PLOT_TMUX_MONITOR=false
+
+# Ideal L1D cache (force eligible global reads to L1D HIT)
+IDEAL_L1D_ENABLED=false
+
+# GRASP prefetcher
+GRASP_ENABLED=false
+GRASP_DEBUG=false
+GRASP_CHAIN_CSV=""
+GRASP_TRACE_ENABLED=false
+GRASP_DISTANCE=0
+GRASP_SPECULATIVE_STRIDE=0
+
+# Extra controls (used to reduce simulation time / output volume)
+MAX_CYCLE=0
+MAX_INSN=0
+MAX_CTA=0
+MAX_COMPLETED_CTA=0
+ISSUE_TRACE_ENABLED=false
+L1_TRACE_ENABLED=false
+L2_TRACE_ENABLED=false
+L2_TRACE_PRINT_BW=false
+L2_TRACE_PRINT_COMPUTE=false
+HBM_TRACE_ENABLED=false
+HBM_TRACE_PERIOD=1
+ICNT_BW_TRACE_ENABLED=false
+L2_BW_TRACE_ENABLED=false
+ICNT_BW_TRACE_PERIOD=500
+L2_BW_TRACE_PERIOD=500
+EXTRA_SIM_ARGS=""                   # raw args appended to gpgpusim config (--sim-args)
+
+# Lightweight stall reason / pc statistics (replaces the huge issue_trace)
+STALL_REASON_PC_STATS_ENABLED=true
+STALL_REASON_PC_STATS_TOPK=5
+
+# Issue trace streaming compression (disabled by default; only affects issue trace)
+# Note: gpgpu-sim's issue_tracer performs "multiple open/close append writes", so a FIFO plus a persistent writer fd is needed to keep the compressor from exiting early on EOF.
+ISSUE_TRACE_COMPRESS="none"         # none|gzip|zstd
+ISSUE_TRACE_COMPRESS_LEVEL=""       # gzip: 1~9; zstd: 1~19 (uses the default if unspecified)
+ISSUE_TRACE_COMPRESS_THREADS=1      # zstd only
+# TRACE_BASE_DIR defaults to the script's directory
+# Try to auto-detect the trace directory under hw_run
+if [ -d "$BASE_DIR/hw_run/traces/device-0" ]; then
+    CUDA_VERSION=$(ls "$BASE_DIR/hw_run/traces/device-0/" | head -n 1)
+    if [ -n "$CUDA_VERSION" ]; then
+        TRACE_BASE_DIR="$BASE_DIR/hw_run/traces/device-0/$CUDA_VERSION"
+    else
+        TRACE_BASE_DIR="$BASE_DIR"
+    fi
+else
+    TRACE_BASE_DIR="$BASE_DIR"
+fi
+
+# Parse command-line arguments (parsed before paths are defined, so CONFIG_MODEL takes effect)
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -c|--config)
+      CONFIG_MODEL="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --ideal-l1d)
+      IDEAL_L1D_ENABLED=true
+      shift # past argument
+      ;;
+    --grasp)
+      GRASP_ENABLED=true
+      shift
+      ;;
+    --grasp-debug)
+      GRASP_ENABLED=true
+      GRASP_DEBUG=true
+      shift
+      ;;
+    --grasp-trace)
+      GRASP_ENABLED=true
+      GRASP_TRACE_ENABLED=true
+      shift
+      ;;
+    --grasp-chain-csv)
+      GRASP_CHAIN_CSV="$2"
+      shift
+      shift
+      ;;
+    --grasp-distance)
+      GRASP_DISTANCE="$2"
+      shift
+      shift
+      ;;
+    --grasp-speculative-stride)
+      GRASP_SPECULATIVE_STRIDE="$2"
+      shift
+      shift
+      ;;
+    --pair-table-scope)
+      PAIR_TABLE_SCOPE="$2"
+      shift
+      shift
+      ;;
+  -nl|--nlevel)
+      NLEVEL_ENABLED=true
+      shift # past argument
+      ;;
+    -gto|--gto)
+      GTO_ENABLED=true
+      shift # past argument
+      ;;
+    -nls|--nlevel-scheduler)
+      if [ -z "$2" ]; then
+        echo "Error: --nlevel-scheduler requires an argument (lrr|gto)"
+        exit 1
+      fi
+      NLEVEL_DEFAULT_SCHEDULER="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -h|--help)
+      SHOW_HELP=true
+      shift # past argument
+      ;;
+    --plot)
+      PLOT_ENABLED=true
+      PLOT_BACKEND="local"
+      shift # past argument
+      ;;
+    --plot-backend)
+      if [ -z "$2" ]; then
+        echo "Error: --plot-backend requires an argument (session|local)"
+        exit 1
+      fi
+      PLOT_ENABLED=true
+      PLOT_BACKEND="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --plot-background)
+      PLOT_ENABLED=true
+      PLOT_BACKEND="local"
+      PLOT_BACKGROUND=true
+      shift # past argument
+      ;;
+    # Backward-compatible aliases (not advertised)
+    --tmux-plots)
+      PLOT_ENABLED=true
+      PLOT_BACKEND="session"
+      shift # past argument
+      ;;
+    --plots)
+      PLOT_ENABLED=true
+      PLOT_BACKEND="local"
+      shift # past argument
+      ;;
+    --plots-parallel)
+      PLOT_ENABLED=true
+      PLOT_BACKEND="local"
+      shift # past argument
+      ;;
+    --plot-format)
+      if [ -z "$2" ]; then
+        echo "Error: --plot-format requires an argument (svg|png|both)"
+        exit 1
+      fi
+      PLOT_FORMAT="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --plot-auto-close)
+      PLOT_TMUX_AUTO_CLOSE=true
+      shift # past argument
+      ;;
+    --plot-monitor)
+      PLOT_TMUX_MONITOR=true
+      shift # past argument
+      ;;
+    --plot-session)
+      if [ -z "$2" ]; then
+        echo "Error: --plot-session requires an argument"
+        exit 1
+      fi
+      PLOT_SESSION="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --plot-attach)
+      PLOT_ATTACH=true
+      shift # past argument
+      ;;
+    --plot-kill-existing)
+      PLOT_KILL_EXISTING=true
+      shift # past argument
+      ;;
+    --max-cycle)
+      MAX_CYCLE="$2"
+      shift
+      shift
+      ;;
+    --max-insn)
+      MAX_INSN="$2"
+      shift
+      shift
+      ;;
+    --max-cta)
+      MAX_CTA="$2"
+      shift
+      shift
+      ;;
+    --max-completed-cta)
+      MAX_COMPLETED_CTA="$2"
+      shift
+      shift
+      ;;
+    --issue-trace)
+      ISSUE_TRACE_ENABLED=true
+      shift
+      ;;
+    --no-issue-trace)
+      ISSUE_TRACE_ENABLED=false
+      shift
+      ;;
+    --no-stall-reason-pc-stats)
+      STALL_REASON_PC_STATS_ENABLED=false
+      shift
+      ;;
+    --stall-reason-pc-stats-topk)
+      STALL_REASON_PC_STATS_TOPK="$2"
+      shift
+      shift
+      ;;
+    --l1-trace)
+      L1_TRACE_ENABLED=true
+      shift
+      ;;
+    --no-l1-trace)
+      L1_TRACE_ENABLED=false
+      shift
+      ;;
+    --l2-trace)
+      L2_TRACE_ENABLED=true
+      shift
+      ;;
+    --no-l2-trace)
+      L2_TRACE_ENABLED=false
+      shift
+      ;;
+    --l2-trace-print-bw)
+      L2_TRACE_PRINT_BW=true
+      shift
+      ;;
+    --l2-trace-print-compute)
+      L2_TRACE_PRINT_COMPUTE=true
+      shift
+      ;;
+    --hbm-trace)
+      HBM_TRACE_ENABLED=true
+      shift
+      ;;
+    --no-hbm-trace)
+      HBM_TRACE_ENABLED=false
+      shift
+      ;;
+    --no-icnt-bw-trace)
+      ICNT_BW_TRACE_ENABLED=false
+      shift
+      ;;
+    --no-l2-bw-trace)
+      L2_BW_TRACE_ENABLED=false
+      shift
+      ;;
+    --hbm-trace-period)
+      HBM_TRACE_PERIOD="$2"
+      shift
+      shift
+      ;;
+    --icnt-bw-trace-period)
+      ICNT_BW_TRACE_PERIOD="$2"
+      shift
+      shift
+      ;;
+    --l2-bw-trace-period)
+      L2_BW_TRACE_PERIOD="$2"
+      shift
+      shift
+      ;;
+    --issue-trace-compress)
+      if [ -z "${2:-}" ]; then
+        echo "Error: --issue-trace-compress requires an argument (none|gzip|zstd)"
+        exit 1
+      fi
+      ISSUE_TRACE_COMPRESS="$2"
+      shift
+      shift
+      ;;
+    --issue-trace-compress-level)
+      if [ -z "${2:-}" ]; then
+        echo "Error: --issue-trace-compress-level requires an argument (gzip:1~9, zstd:1~19)"
+        exit 1
+      fi
+      ISSUE_TRACE_COMPRESS_LEVEL="$2"
+      shift
+      shift
+      ;;
+    --issue-trace-compress-threads)
+      if [ -z "${2:-}" ]; then
+        echo "Error: --issue-trace-compress-threads requires an argument (zstd only)"
+        exit 1
+      fi
+      ISSUE_TRACE_COMPRESS_THREADS="$2"
+      shift
+      shift
+      ;;
+    --sim-args)
+      EXTRA_SIM_ARGS="$2"
+      shift; shift
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1") # save positional arg
+      shift # past argument
+      ;;
+  esac
+done
+
+# Restore positional arguments
+set -- "${POSITIONAL_ARGS[@]}"
+
+# Define paths
+ACCEL_SIM_BIN="$BASE_DIR/gpu-simulator/bin/release/accel-sim.out"
+TRACE_CONFIG="$BASE_DIR/gpu-simulator/configs/tested-cfgs/$CONFIG_MODEL/trace.config"
+GPGPU_CONFIG="$BASE_DIR/gpu-simulator/gpgpu-sim/configs/tested-cfgs/$CONFIG_MODEL/gpgpusim.config"
+RESULT_LOG_DIR="$BASE_DIR/result/log"
+RESULT_L1_DIR="$BASE_DIR/result/L1cache_trace"
+RESULT_L2_DIR="$BASE_DIR/result/L2cache_trace"
+RESULT_ISSUE_DIR="$BASE_DIR/result/issue_trace"
+RESULT_STALL_REASON_PC_STATS_BASE_DIR="$RESULT_ISSUE_DIR/stall_reason_pc_stats"
+RESULT_BW_DIR="$BASE_DIR/result/bandwidth"
+RESULT_ICNT_BW_DIR="$BASE_DIR/result/icnt_bw"
+RESULT_L2_BW_DIR="$BASE_DIR/result/l2_bw"
+RESULT_GRASP_TRACE_DIR="$BASE_DIR/result/grasp_trace"
+
+# Create result directories (if they don't exist)
+mkdir -p "$RESULT_LOG_DIR"
+mkdir -p "$RESULT_L1_DIR"
+mkdir -p "$RESULT_L2_DIR"
+mkdir -p "$RESULT_ISSUE_DIR"
+mkdir -p "$RESULT_STALL_REASON_PC_STATS_BASE_DIR"
+mkdir -p "$RESULT_BW_DIR"
+mkdir -p "$RESULT_ICNT_BW_DIR"
+mkdir -p "$RESULT_L2_BW_DIR"
+
+# Define the trace key table and corresponding paths
+declare -A TRACE_MAP=(
+    #gardenia
+    ["bfs_usa"]="bfs_linear_base/mtx___data_road_usa_0_0_0/traces/kernelslist.g"
+    ["bfs_web"]="bfs_linear_base/mtx___data_web_Google_0_0_0/traces/kernelslist.g"
+    ["bfs_socLive"]="bfs_linear_base/mtx___data_soc_LiveJournal1_0_0_0/traces/kernelslist.g"
+    ["bfs_cit"]="bfs_linear_base/mtx___data_cit_Patents_0_0_0/traces/kernelslist.g"
+    # IMA configuration (cit-Patents, symmetrize=1, source=3569341)
+    ["bfs_cit_ima"]="bfs_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    # IMA tiers (aligned with define-all-apps.yml; source sensitive)
+    ["bfs_ima_high"]="bfs_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    ["bfs_ima_med"]="bfs_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bfs_ima_small"]="bfs_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
+    # IMA (friendlier): cit-Patents, symmetrize=0 (directed), source=3569341 (requires generating the corresponding traces first)
+    ["bfs_cit_ima_dir"]="bfs_linear_base/mtx___data_cit_Patents_0_0_3569341/traces/kernelslist.g"
+    ["bfs_roadnet"]="bfs_linear_base/mtx___data_roadNet_CA_0_0_0/traces/kernelslist.g"
+    ["bfs_flickr"]="bfs_linear_base/mtx___data_flickr_0_0_0/traces/kernelslist.g"
+    ["spmv_cu"]="spmv_cusparse/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    ["spmv"]="spmv_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    # IMA tiers (direction sensitive; spmv input must be undirected/symmetric => 2 tiers, no small)
+    ["spmv_ima_high"]="spmv_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+    ["spmv_ima_med"]="spmv_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    # IMA configuration (cit-Patents, symmetrize=1)
+    ["spmv_cit_ima"]="spmv_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+
+    # IMA tiers (aligned with define-all-apps.yml; source sensitive)
+    ["sssp_ima_high"]="sssp_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    ["sssp_ima_med"]="sssp_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["sssp_ima_small"]="sssp_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
+
+    # IMA tiers(source & direction insensitive => 2 tiers)
+    ["tc_ima_high"]="tc_gpu_base/__data_cit_Patents/traces/kernelslist.g"
+    ["tc_ima_low"]="tc_gpu_base/__data_web_Google/traces/kernelslist.g"
+    ["tc"]="tc_gpu_base/__data_web_Google/traces/kernelslist.g"
+
+    ["cc"]="cc_base/mtx___data_web_Google_1_1/traces/kernelslist.g"
+    # IMA tiers (aligned with define-all-apps.yml; direction sensitive)
+    ["cc_ima_high"]="cc_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+    ["cc_ima_med"]="cc_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    ["cc_ima_small"]="cc_base/mtx___data_web_Google_0_0/traces/kernelslist.g"
+
+    ["bc"]="bc_linear_base/mtx___data_web_Google_0/traces/kernelslist.g"
+    # IMA tiers (aligned with define-all-apps.yml; source sensitive)
+    ["bc_ima_high"]="bc_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    ["bc_ima_med"]="bc_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bc_ima_small"]="bc_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
+
+    # Gardenia IMA tiers (newly traced workloads)
+    ["pr_ima_high"]="pr_base/mtx___data_cit_Patents_1/traces/kernelslist.g"
+    ["pr_ima_med"]="pr_base/mtx___data_web_Google_1/traces/kernelslist.g"
+    ["pr_ima_small"]="pr_base/mtx___data_web_Google_0/traces/kernelslist.g"
+
+    ["scc_ima_high"]="scc_topo/__data_cit_Patents_mtx_1/traces/kernelslist.g"
+    ["scc_ima_med"]="scc_topo/__data_web_Google_mtx_1/traces/kernelslist.g"
+    ["scc_ima_small"]="scc_topo/__data_flickr_mtx_1/traces/kernelslist.g"
+
+    ["vc_ima_high"]="vc_linear_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+    ["vc_ima_med"]="vc_linear_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    ["vc_ima_small"]="vc_linear_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+    ["vc_road"]="vc_linear_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+
+    ["symgs_ima_high"]="symgs_base/mtx___data_cit_Patents_1/traces/kernelslist.g"
+    ["symgs_ima_med"]="symgs_base/mtx___data_web_Google_1/traces/kernelslist.g"
+    ["symgs_ima_small"]="symgs_base/mtx___data_roadNet_CA_1/traces/kernelslist.g"
+
+    # ============================================================
+    # 4-category dataset evaluation (2026-03-31)
+    # Naming: {algo}_{dataset}_{dir|sym}
+    #   dir = directed (sym=0), sym = symmetrized (sym=1)
+    #   Existing *_ima_{high,med} keys are reused where applicable
+    # ============================================================
+
+    # --- cit-Patents directed (sym=0) supplements ---
+    ["bc_cit_dir"]="bc_linear_base/mtx___data_cit_Patents_0_0_3569341/traces/kernelslist.g"
+    ["pr_cit_dir"]="pr_base/mtx___data_cit_Patents_0/traces/kernelslist.g"
+    ["symgs_cit_dir"]="symgs_base/mtx___data_cit_Patents_0/traces/kernelslist.g"
+
+    # --- web-Google directed (sym=0) supplement ---
+    ["symgs_web_dir"]="symgs_base/mtx___data_web_Google_0/traces/kernelslist.g"
+
+    # --- flickr (social network) ---
+    # source-based (hub=1586)
+    ["bfs_flickr_dir"]="bfs_linear_base/mtx___data_flickr_0_0_1586/traces/kernelslist.g"
+    ["bfs_flickr_sym"]="bfs_linear_base/mtx___data_flickr_1_0_1586/traces/kernelslist.g"
+    ["sssp_flickr_dir"]="sssp_linear_base/mtx___data_flickr_0_0_1586/traces/kernelslist.g"
+    ["sssp_flickr_sym"]="sssp_linear_base/mtx___data_flickr_1_0_1586/traces/kernelslist.g"
+    ["bc_flickr_dir"]="bc_linear_base/mtx___data_flickr_0_0_1586/traces/kernelslist.g"
+    ["bc_flickr_sym"]="bc_linear_base/mtx___data_flickr_1_0_1586/traces/kernelslist.g"
+    # source-independent
+    ["cc_flickr"]="cc_base/mtx___data_flickr_1_0/traces/kernelslist.g"
+    ["spmv_flickr"]="spmv_base/mtx___data_flickr_1_0/traces/kernelslist.g"
+    ["pr_flickr_dir"]="pr_base/mtx___data_flickr_0/traces/kernelslist.g"
+    ["pr_flickr_sym"]="pr_base/mtx___data_flickr_1/traces/kernelslist.g"
+    # VC/SymGS: MAXCOLOR=128 crash on flickr — not available
+
+    # --- roadNet-CA (road network) ---
+    # source-based (dir hub=117563, sym hub=562818)
+    ["bfs_road_dir"]="bfs_linear_base/mtx___data_roadNet_CA_0_0_117563/traces/kernelslist.g"
+    ["bfs_road_sym"]="bfs_linear_base/mtx___data_roadNet_CA_1_0_562818/traces/kernelslist.g"
+    ["sssp_road_dir"]="sssp_linear_base/mtx___data_roadNet_CA_0_0_117563/traces/kernelslist.g"
+    ["sssp_road_sym"]="sssp_linear_base/mtx___data_roadNet_CA_1_0_562818/traces/kernelslist.g"
+    ["bc_road_dir"]="bc_linear_base/mtx___data_roadNet_CA_0_0_117563/traces/kernelslist.g"
+    ["bc_road_sym"]="bc_linear_base/mtx___data_roadNet_CA_1_0_562818/traces/kernelslist.g"
+    # source-independent
+    ["cc_road"]="cc_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+    ["spmv_road"]="spmv_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+    ["pr_road_dir"]="pr_base/mtx___data_roadNet_CA_0/traces/kernelslist.g"
+    ["pr_road_sym"]="pr_base/mtx___data_roadNet_CA_1/traces/kernelslist.g"
+    ["symgs_road_dir"]="symgs_base/mtx___data_roadNet_CA_0/traces/kernelslist.g"
+    # vc_road = vc_ima_small (already defined above), symgs_road_sym = symgs_ima_small
+
+    # --- soc-LiveJournal1 (large social-network extension) ---
+    ["bfs_socLJ_dir"]="bfs_linear_base/mtx___data_soc_LiveJournal1_0_0_10009/traces/kernelslist.g"
+    ["bfs_socLJ_sym"]="bfs_linear_base/mtx___data_soc_LiveJournal1_1_0_10009/traces/kernelslist.g"
+    ["spmv_socLJ"]="spmv_base/mtx___data_soc_LiveJournal1_1_0/traces/kernelslist.g"
+
+    # ============================================================
+    # Unified naming: {algo}_{dataset}_{dir|sym}
+    # These are canonical names used in benchmark_suite.md.
+    # Old *_ima_* keys are kept above for backward compat.
+    # ============================================================
+
+    # --- cit-Patents sym=1 (= ima_high) ---
+    ["bfs_cit_sym"]="bfs_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    ["sssp_cit_sym"]="sssp_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    ["bc_cit_sym"]="bc_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
+    ["cc_cit_sym"]="cc_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+    ["spmv_cit_sym"]="spmv_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+    ["pr_cit_sym"]="pr_base/mtx___data_cit_Patents_1/traces/kernelslist.g"
+    ["vc_cit_sym"]="vc_linear_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
+
+    # --- cit-Patents dir (already defined above) ---
+    ["bfs_cit_dir"]="bfs_linear_base/mtx___data_cit_Patents_0_0_3569341/traces/kernelslist.g"
+    ["sssp_cit_dir"]="sssp_linear_base/mtx___data_cit_Patents_0_0_3569341/traces/kernelslist.g"
+
+    # --- web-Google sym=1 (= ima_med) ---
+    ["bfs_web_sym"]="bfs_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["sssp_web_sym"]="sssp_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bc_web_sym"]="bc_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["cc_web_sym"]="cc_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    ["spmv_web_sym"]="spmv_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+    ["pr_web_sym"]="pr_base/mtx___data_web_Google_1/traces/kernelslist.g"
+    ["vc_web_sym"]="vc_linear_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
+
+    # --- flickr sym=1: fill in the _sym suffix ---
+    ["cc_flickr_sym"]="cc_base/mtx___data_flickr_1_0/traces/kernelslist.g"
+    ["spmv_flickr_sym"]="spmv_base/mtx___data_flickr_1_0/traces/kernelslist.g"
+
+    # --- roadNet-CA sym=1: fill in the _sym suffix ---
+    ["cc_road_sym"]="cc_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+    ["spmv_road_sym"]="spmv_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+    ["vc_road_sym"]="vc_linear_base/mtx___data_roadNet_CA_1_0/traces/kernelslist.g"
+
+    # --- soc-LJ1: fill in _sym ---
+    ["spmv_socLJ_sym"]="spmv_base/mtx___data_soc_LiveJournal1_1_0/traces/kernelslist.g"
+    # web-Google dir aliases for BFS/SSSP/BC/PR (existing traces)
+    ["bfs_web_dir"]="bfs_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
+    ["sssp_web_dir"]="sssp_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
+    ["bc_web_dir"]="bc_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
+    ["pr_web_dir"]="pr_base/mtx___data_web_Google_0/traces/kernelslist.g"
+
+    # --- Variant sweep: web-Google sym=1 (14 implementation variants vs baselines) ---
+    ["bfs_topo_web_sym"]="bfs_topo_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bfs_lb_web_sym"]="bfs_linear_lb/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["sssp_lb_web_sym"]="sssp_linear_lb/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["sssp_topo_web_sym"]="sssp_topo_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bc_lb_web_sym"]="bc_linear_lb/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bc_topo_web_sym"]="bc_topo_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["bc_hlb_web_sym"]="bc_hybrid_lb/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
+    ["cc_affo_web_sym"]="cc_afforest/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    ["cc_warp_web_sym"]="cc_warp/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    ["cc_part_web_sym"]="cc_partition/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    ["spmv_warp_web_sym"]="spmv_warp/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    ["spmv_tile_web_sym"]="spmv_tiling/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    ["vc_topo_web_sym"]="vc_topo_base/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    ["vc_bits_web_sym"]="vc_linear_bitset/mtx___data_web_Google_1_0_0/traces/kernelslist.g"
+    # --- Variant sweep: source=0 re-traces (for topo-driven variants to validate source-CTA alignment) ---
+    ["bfs_topo_s0_web_sym"]="bfs_topo_base/mtx___data_web_Google_1_0_0_src0/traces/kernelslist.g"
+    ["sssp_topo_s0_web_sym"]="sssp_topo_base/mtx___data_web_Google_1_0_0_src0/traces/kernelslist.g"
+
+
+    # flash attention
+    ["fa"]="fa/NO_ARGS/traces/kernelslist.g"
+    ["fa4k"]="fa_4096seq/NO_ARGS/traces/kernelslist.g"
+    ["fi_dec_512"]="flashinfer_decode_512/NO_ARGS/traces/kernelslist.g"
+    ["fi_dec_4k"]="flashinfer_decode_4096/NO_ARGS/traces/kernelslist.g"
+    ["ima_tiny_case"]="ima_tiny_case/NO_ARGS/traces/kernelslist.g"
+    ["ima_tiny_case_current"]="ima_tiny_case_current/NO_ARGS/traces/kernelslist.g"
+
+    #cache strategy
+    ["wb"]="/strategybench.sm80/__test_alloc___store_wb/traces/kernelslist.g"
+    ["wb2"]="/strategybench.sm80/__test_alloc2___store_wb/traces/kernelslist.g"
+    ["cg"]="/strategybench.sm80/__test_alloc___store_cg/traces/kernelslist.g"
+
+    
+    # GEMM series
+    ["gemm128"]="gemm128/NO_ARGS/traces/kernelslist.g"
+    ["gemm256"]="gemm256/NO_ARGS/traces/kernelslist.g"
+    ["gemm384"]="gemm384/NO_ARGS/traces/kernelslist.g"
+    ["gemm512"]="gemm512/NO_ARGS/traces/kernelslist.g"
+    ["gemm768"]="gemm768/NO_ARGS/traces/kernelslist.g"
+    ["gemm1024"]="gemm1024/NO_ARGS/traces/kernelslist.g"
+    ["gemm1536"]="gemm1536/NO_ARGS/traces/kernelslist.g"
+    ["gemm2048"]="gemm2048/NO_ARGS/traces/kernelslist.g"
+    ["gemm4096"]="gemm4096/NO_ARGS/traces/kernelslist.g"
+    ["gemm_cublas"]="gemm_cublas/NO_ARGS/traces/kernelslist.g"
+    
+    # Rodinia benchmark series
+    ["btree"]="b+tree-rodinia-3.1/file___data_mil_txt_command___data_command_txt/traces/kernelslist.g"
+    ["btree_s20"]="b+tree-rodinia-3.1/file___data_mil_20_txt_command___data_command_txt/traces/kernelslist.g"       #random seed is 20
+    ["btree_s123"]="b+tree-rodinia-3.1/file___data_mil_123_txt_command___data_command_txt/traces/kernelslist.g"     #random seed is 123
+    ["btree_5900"]="b+tree-rodinia-3.1/file___data_mil_txt_command___data_j5900k9900_txt/traces/kernelslist.g"      #range search executes 5900
+    ["btree_6100"]="b+tree-rodinia-3.1/file___data_mil_txt_command___data_j6100k10100_txt/traces/kernelslist.g"     #range search executes 6100
+    ["backprop"]="backprop-rodinia-3.1/65536/traces/kernelslist.g"
+    # ["bfs"]="bfs-rodinia-3.1/__data_graph65536_txt/traces/kernelslist.g"
+    ["bfs"]="bfs-rodinia-3.1/__data_graph1MW_6_txt/traces/kernelslist.g"
+    ["gaussian"]="gaussian-rodinia-3.1/_s_256/traces/kernelslist.g"
+    ["hotspot"]="hotspot-rodinia-3.1/512_2_2___data_temp_512___data_power_512_output_out/traces/kernelslist.g"
+    ["hotspot_7"]="hotspot-rodinia-3.1/512_7_2___data_temp_512___data_power_512_output_out/traces/kernelslist.g"
+    ["hotspot_3"]="hotspot-rodinia-3.1/512_3_2___data_temp_512___data_power_512_output_out/traces/kernelslist.g"
+    ["lavaMD"]="lavaMD-rodinia-3.1/_boxes1d_10/traces/kernelslist.g"
+    ["lud"]="lud-rodinia-3.1/_s_256__v/traces/kernelslist.g"
+    ["nw"]="nw-rodinia-3.1/2048_10/traces/kernelslist.g"
+    ["pathfinder"]="pathfinder-rodinia-3.1/100000_100_20___result_txt/traces/kernelslist.g"
+    ["pathfinder22"]="pathfinder-rodinia-3.1/100000_100_22___result_txt/traces/kernelslist.g"       #pyramid height is 22
+    ["pathfinder18"]="pathfinder-rodinia-3.1/100000_100_18___result_txt/traces/kernelslist.g"       #pyramid height is 18
+    ["pathfinder_s1"]="pathfinder-rodinia-3.1/100000_100_20_1___result_txt/traces/kernelslist.g"    #random seed is 1
+    ["pathfinder_s2"]="pathfinder-rodinia-3.1/100000_100_20_2___result_txt/traces/kernelslist.g"    #random seed is 2
+    ["streamcluster"]="streamcluster-rodinia-3.1/10000_20_32_2000_10_1/traces/kernelslist.g"
+    ["srad"]="srad_v1-rodinia-3.1/100_0_5_502_458/traces/kernelslist.g"
+    ["myocyte"]="myocyte-rodinia-3.1/100_1_0/traces/kernelslist.g"
+    ["nn"]="nn-rodinia-3.1/__data_filelist_4__r_5__lat_30__lng_90/traces/kernelslist.g"
+    ["particlefilter_float"]="particlefilter_float-rodinia-3.1/_x_128__y_128__z_10__np_1000/traces/kernelslist.g"
+    ["particlefilter_naive"]="particlefilter_naive-rodinia-3.1/_x_128__y_128__z_10__np_1000/traces/kernelslist.g"
+    ["dwt2d"]="dwt2d-rodinia-3.1/NO_ARGS/traces/kernelslist.g"
+    
+    # Polybench series
+    ["2mm"]="polybench-2mm/NO_ARGS/traces/kernelslist.g"
+    ["3mm"]="polybench-3mm/NO_ARGS/traces/kernelslist.g"
+    ["gemm_poly"]="polybench-gemm/NO_ARGS/traces/kernelslist.g"
+    ["atax"]="polybench-atax/NO_ARGS/traces/kernelslist.g"
+    ["bicg"]="polybench-bicg/NO_ARGS/traces/kernelslist.g"
+    ["correlation"]="polybench-correlation/NO_ARGS/traces/kernelslist.g"
+    ["covariance"]="polybench-covariance/NO_ARGS/traces/kernelslist.g"
+    ["fdtd2d"]="polybench-fdtd2d/NO_ARGS/traces/kernelslist.g"
+    ["gesummv"]="polybench-gesummv/NO_ARGS/traces/kernelslist.g"
+    ["gramschmidt"]="polybench-gramschmidt/NO_ARGS/traces/kernelslist.g"
+    ["mvt"]="polybench-mvt/NO_ARGS/traces/kernelslist.g"
+    ["syr2k"]="polybench-syr2k/NO_ARGS/traces/kernelslist.g"
+    ["syrk"]="polybench-syrk/NO_ARGS/traces/kernelslist.g"
+    ["2DConvolution"]="polybench-2DConvolution/NO_ARGS/traces/kernelslist.g"
+    ["3DConvolution"]="polybench-3DConvolution/NO_ARGS/traces/kernelslist.g"
+    
+    # Other applications
+    ["fw"]="fw/__data_256_16384_gr/traces/kernelslist.g"
+    ["fw_block"]="fw_block/__data_256_16384_gr/traces/kernelslist.g"
+    ["color_max"]="color_max/__data_ecology1_graph_1/traces/kernelslist.g"
+    ["color_maxmin"]="color_maxmin/__data_ecology1_graph_1/traces/kernelslist.g"
+    ["mis"]="mis/__data_ecology1_graph_1/traces/kernelslist.g"
+    ["pagerank"]="pagerank/__data_coAuthorsDBLP_graph_1/traces/kernelslist.g"
+    ["pagerank_spmv"]="pagerank_spmv/NO_ARGS/traces/kernelslist.g"
+    ["l1_bw_32f"]="l1_bw_32f/NO_ARGS/traces/kernelslist.g"
+
+    # === Pannotia MIS (SNAP datasets) ===
+    ["pann_mis_cit"]="pann_mis_cit-Patents/traces/kernelslist.g"
+    ["pann_mis_web"]="pann_mis_web-Google/traces/kernelslist.g"
+    ["pann_mis_flickr"]="pann_mis_flickr/traces/kernelslist.g"
+    ["pann_mis_road"]="pann_mis_roadNet-CA/traces/kernelslist.g"
+
+    # === Pannotia Color (SNAP datasets) ===
+    ["pann_color_cit"]="pann_color_cit-Patents/traces/kernelslist.g"
+    ["pann_color_web"]="pann_color_web-Google/traces/kernelslist.g"
+    ["pann_color_road"]="pann_color_roadNet-CA/traces/kernelslist.g"
+
+    # === LonestarGPU MST (SNAP datasets) ===
+    ["ls_mst_cit"]="ls_mst_cit-Patents/traces/kernelslist.g"
+    ["ls_mst_web"]="ls_mst_web-Google/traces/kernelslist.g"
+    ["ls_mst_flickr"]="ls_mst_flickr/traces/kernelslist.g"
+    ["ls_mst_road"]="ls_mst_roadNet-CA/traces/kernelslist.g"
+
+    # === LonestarGPU non-graph algorithms ===
+    ["ls_sp"]="ls_sp_small/traces/kernelslist.g"
+    ["ls_sp_med"]="ls_sp_med/traces/kernelslist.g"
+    ["ls_sp_42k3"]="ls_sp_42k_3/traces/kernelslist.g"
+    ["ls_sp_42k5"]="ls_sp_42k_5/traces/kernelslist.g"
+    ["ls_dmr_r1m"]="ls_dmr_r1m/traces/kernelslist.g"
+    ["ls_pta"]="ls_pta_ex/traces/kernelslist.g"
+    ["ls_dmr"]="ls_dmr_250k/traces/kernelslist.g"
+    ["ls_dmr_25k"]="ls_dmr_25k/traces/kernelslist.g"
+    ["ls_dmr_25k_tiny"]="ls_dmr_25k_tiny/traces/kernelslist.g"
+    ["ls_dmr_25k_kc1"]="ls_dmr_25k_kc1/traces/kernelslist.g"
+    ["ls_dmr_25k_kr28"]="ls_dmr_25k_kr28/traces/kernelslist.g"
+    ["ls_mst_flickr_k3"]="ls_mst_flickr_k3/traces/kernelslist.g"
+    ["ls_mst_flickr_k3only"]="ls_mst_flickr_k3only/traces/kernelslist.g"
+    # small default datasets
+    ["pann_mis_eco"]="pann_mis_ecology1/traces/kernelslist.g"
+    ["pann_mis_g3"]="pann_mis_g3circuit/traces/kernelslist.g"
+    ["pann_color_eco"]="pann_color_ecology1/traces/kernelslist.g"
+    ["pann_color_g3"]="pann_color_g3circuit/traces/kernelslist.g"
+    ["ls_mst_rmat12"]="ls_mst_rmat12/traces/kernelslist.g"
+    ["ls_mst_usany"]="ls_mst_usany/traces/kernelslist.g"
+    ["ls_mst_2d2e20"]="ls_mst_2d2e20/traces/kernelslist.g"
+    ["ls_mst_usafla"]="ls_mst_usafla/traces/kernelslist.g"
+)
+
+# n_level warp alloc file mapping (uses trace_key by default; gto uses <trace_key>gto)
+declare -A NLEVEL_WARP_ALLOC_MAP=(
+    ["fa"]="gpu-simulator/gpgpu-sim/n-level/output/fa_issue_warp_allocate.csv"
+    ["fa4k"]="gpu-simulator/gpgpu-sim/n-level/output/fa4k_issue_warp_allocate.csv"
+    ["fa4kgto"]="gpu-simulator/gpgpu-sim/n-level/output/fa4k_gto_issue_warp_allocate.csv"
+    ["smpv_cu"]="gpu-simulator/gpgpu-sim/n-level/output/smpv_cu_issue_warp_allocate.csv"
+)
+
+# Show usage instructions
+show_usage() {
+    echo "Usage: $0 [options] <trace_key> [log_name]"
+    echo ""
+    echo "Options:"
+    echo "  -c, --config <model>  Specify the GPU config model (default: SM80_A100)"
+    echo "                        Supported: SM7_QV100, SM80_A100"
+    echo "  --ideal-l1d            Enable Ideal L1D: force eligible global reads to L1D HIT (upper-bound experiment; log name auto-appends the _ideal_l1d suffix)"
+    echo "  --grasp                Enable the GRASP IMA prefetcher (default chain CSV: data/golden_chains/strict_selected_chain_instances.csv)"
+    echo "  --grasp-debug          Enable GRASP + verbose debug logging"
+    echo "  --grasp-trace          Enable GRASP + structured CSV event trace (implies --grasp)"
+    echo "  --pair-table-scope <s> IMA pair table scope: warp(default)/cta/kernel"
+    echo "  --grasp-chain-csv <path>  Specify the GRASP chain CSV file path"
+    echo "  -nl, --nlevel         Enable the n_level scheduler (log name auto-appends the _nl suffix; mutually exclusive with -gto)"
+    echo "  -nls, --nlevel-scheduler <lrr|gto>"
+    echo "                        Select the n_level default scheduler and match the warp alloc file (default: lrr)"
+    echo "  -gto, --gto           Enable the gto scheduler (log name auto-appends the _gto suffix; mutually exclusive with -nl)"
+    echo "  --plot                Automatically plot in parallel and show progress after the simulation ends (recommended, one-click mode)"
+    echo "  --plot-backend <session|local>  Select the plotting backend (default: local)"
+    echo "  --plot-background      With the local backend, plot in parallel and detach to the background (returns immediately after writing the log)"
+    echo "  --plot-format <svg|png|both>  Plot output format (default: svg; png/both may require matplotlib+numpy)"
+    echo "  --plot-session <name>         Specify the session name (auto-generated by default)"
+    echo "  --plot-kill-existing          Kill the session first if it already exists"
+    echo "  --plot-attach                 Attach directly to the session after it finishes running"
+    echo "  --plot-auto-close             With the session backend, auto-close the window when plotting finishes (session is kept)"
+    echo "  --plot-monitor                With the session backend, add a monitor window showing the log tail (for watching progress)"
+    echo ""
+    echo "  # Volume control (strongly recommended for graph workloads, to avoid TB-scale CSV output)"
+    echo "  --issue-trace                 Enable issue trace (disabled by default; uses the most space / slowest)"
+    echo "  --no-issue-trace              Disable issue trace (disabled by default; uses the most space / slowest)"
+    echo "  --no-stall-reason-pc-stats    Disable the lightweight stall reason->pc statistics (enabled by default; replaces issue trace)"
+    echo "  --stall-reason-pc-stats-topk <K>  Set the topK per reason (default 5; 0 = do not output topk_other.csv)"
+    echo "  --l1-trace                    Enable L1 trace (disabled by default)"
+    echo "  --no-l1-trace                 Disable L1 trace (disabled by default)"
+    echo "  --l2-trace                    Enable L2 trace (disabled by default)"
+    echo "  --no-l2-trace                 Disable L2 trace (disabled by default)"
+    echo "  --l2-trace-print-bw           Print HBM bandwidth/occupancy in the L2 trace"
+    echo "  --l2-trace-print-compute      Print SM compute utilization in the L2 trace"
+    echo "  --hbm-trace                   Enable HBM per-partition bandwidth trace (disabled by default)"
+    echo "  --no-hbm-trace                Disable HBM per-partition bandwidth trace (disabled by default)"
+    echo "  --no-icnt-bw-trace            Disable ICNT bandwidth trace (disabled by default)"
+    echo "  --no-l2-bw-trace              Disable L2 port bandwidth trace (disabled by default)"
+    echo "  --hbm-trace-period <N>        HBM trace sampling period (default 1; 100/1000 recommended)"
+    echo "  --icnt-bw-trace-period <N>    ICNT bandwidth trace sampling period (default 500)"
+    echo "  --l2-bw-trace-period <N>      L2 port bandwidth trace sampling period (default 500)"
+    echo ""
+    echo "  # Issue trace streaming compression (avoids generating an oversized CSV; output is .csv.gz/.csv.zst)"
+    echo "  --issue-trace-compress <none|gzip|zstd>   Issue trace compression method (default: none)"
+    echo "  --issue-trace-compress-level <N>          Compression level (gzip:1~9; zstd:1~19; uses the default if unspecified)"
+    echo "  --issue-trace-compress-threads <N>        Number of zstd threads (default 1; 1 recommended when running in parallel)"
+    echo "  --max-cycle <N>               Early termination: simulate at most N cycles (0 = unlimited)"
+    echo "  --max-insn <N>                Early termination: simulate at most N instructions (0 = unlimited)"
+    echo "  --max-cta <N>                 Early termination: launch at most N CTAs (0 = unlimited)"
+    echo "  --max-completed-cta <N>       Early termination: complete at most N CTAs (0 = unlimited)"
+    echo ""
+    echo "Arguments:"
+    echo "  trace_key  - Required, the trace key to run"
+    echo "  log_name   - Optional, custom log file name (without extension)"
+    echo ""
+    echo "Available trace keys:"
+    for key in "${!TRACE_MAP[@]}"; do
+        echo "  $key"
+    done | sort
+    echo ""
+    echo "Examples:"
+    echo "  $0 gemm128              # Run the GEMM128 benchmark with the default configuration"
+    echo "  $0 -c SM80_A100 gemm128 # Run using the SM80_A100 configuration"
+    echo "  $0 btree my_test        # Run the B+Tree benchmark with a custom log name"
+    echo "  $0 2mm 2mm_experiment   # Run the Polybench 2MM benchmark with a custom log name"
+    echo "  $0 -gto fa              # Run FA with the gto scheduler enabled"
+    echo "  $0 -nl fa               # Run FA with the n_level scheduler enabled"
+    echo "  $0 -nl -nls gto fa4k     # n_level using the gto default scheduler, matched with the corresponding warp alloc file"
+    echo "  $0 -nl -nls lrr fa4k     # n_level using the lrr default scheduler (default behavior)"
+    echo "  $0 --plot sssp           # Automatically plot in parallel and show progress after it finishes"
+    echo "  $0 --plot --plot-format png sssp     # Auto-plot with PNG output"
+    echo "  $0 --plot --plot-format both sssp    # Auto-plot with both SVG+PNG output"
+    echo "  $0 --plot-backend session --plot-monitor sssp  # Run in the background via session, and watch progress in the monitor"
+    echo "  $0 --no-issue-trace bfs_web                     # Disable issue trace, significantly speeds up and shrinks output"
+    echo "  $0 --issue-trace-compress gzip bfs_roadnet bfs_roadnet_gz   # Issue trace streaming compression (recommended for large-scale runs)"
+    echo "  $0 --max-completed-cta 200 bfs_web              # Run only the first 200 CTAs (quickly check the IMA trend)"
+    echo "  $0 --hbm-trace-period 100 spmv                  # Bandwidth trace sampled every 100 cycles"
+    echo "  $0 --ideal-l1d bfs_usa bfs_usa_ideal_l1d        # Ideal L1D upper-bound experiment"
+    echo "  $0 --grasp bfs_ima_small bfs_grasp              # GRASP prefetcher experiment"
+    echo "  $0 --grasp-debug --max-completed-cta 5 bfs_ima_small grasp_dbg  # GRASP debug mode"
+    echo ""
+    echo "L1/ISSUE trace post-processing (generates a CSV with L1 hit info):"
+    echo "  python result/issue_trace/issue_trace_l1_match.py <issue_csv> [options]"
+    echo "    --l1-dir <dir>       # Specify the L1 trace CSV directory, default result/L1cache_trace"
+    echo "    --output-tag <tag>   # Output directory/file suffix, default per_sm"
+    echo "    --output-mode <mode> # per-sm(default) outputs per SM, single generates one merged CSV"
+    echo "    --split-l1-trace     # Additionally split the L1 trace itself into per-SM CSVs"
+    echo "  Matching rule: only processes GLOBAL/LOCAL LOAD/STORE with a nonzero mask; the entire warp must be all HIT to record a HIT;"
+    echo "  Output columns include l1_cycle, l1_sector_addresses, l1_lane_ids, l1_cycle_delta and their status, with an automatic warning when the cycle difference exceeds 100."
+    echo "  Any unconsumed L1 events are listed in unmatched_l1_events.csv (or the corresponding file in single mode) for debugging."
+    echo "  If some issues fail to match all sectors within 200 cycles, matching_warnings.csv is generated for troubleshooting."
+}
+
+# Check arguments
+if [ "$SHOW_HELP" = true ] || [ $# -eq 0 ]; then
+  show_usage
+  exit 0
+fi
+
+# Scheduler option mutual-exclusion check
+if [ "$NLEVEL_ENABLED" = true ] && [ "$GTO_ENABLED" = true ]; then
+    echo "Error: -nl and -gto cannot be used together"
+    echo ""
+    show_usage
+    exit 1
+fi
+
+PLOT_BACKEND="$(echo "$PLOT_BACKEND" | tr 'A-Z' 'a-z')"
+if [ "$PLOT_BACKEND" != "session" ] && [ "$PLOT_BACKEND" != "local" ]; then
+    echo "Error: --plot-backend only supports session|local (current: $PLOT_BACKEND)"
+    exit 1
+fi
+
+NLEVEL_DEFAULT_SCHEDULER="$(echo "$NLEVEL_DEFAULT_SCHEDULER" | tr 'A-Z' 'a-z')"
+if [ "$NLEVEL_DEFAULT_SCHEDULER" != "lrr" ] && [ "$NLEVEL_DEFAULT_SCHEDULER" != "gto" ]; then
+    echo "Error: the n_level default scheduler only supports lrr or gto (current: $NLEVEL_DEFAULT_SCHEDULER)"
+    exit 1
+fi
+
+PLOT_FORMAT="$(echo "$PLOT_FORMAT" | tr 'A-Z' 'a-z')"
+if [ "$PLOT_FORMAT" != "svg" ] && [ "$PLOT_FORMAT" != "png" ] && [ "$PLOT_FORMAT" != "both" ]; then
+    echo "Error: --plot-format only supports svg|png|both (current: $PLOT_FORMAT)"
+    exit 1
+fi
+
+# Issue trace compression parameter check
+ISSUE_TRACE_COMPRESS="$(echo "$ISSUE_TRACE_COMPRESS" | tr 'A-Z' 'a-z')"
+if [ "$ISSUE_TRACE_COMPRESS" != "none" ] && [ "$ISSUE_TRACE_COMPRESS" != "gzip" ] && [ "$ISSUE_TRACE_COMPRESS" != "zstd" ]; then
+    echo "Error: --issue-trace-compress only supports none|gzip|zstd (current: $ISSUE_TRACE_COMPRESS)"
+    exit 1
+fi
+if [ -n "${ISSUE_TRACE_COMPRESS_LEVEL}" ]; then
+    if ! [[ "${ISSUE_TRACE_COMPRESS_LEVEL}" =~ ^[0-9]+$ ]]; then
+        echo "Error: --issue-trace-compress-level must be an integer (current: $ISSUE_TRACE_COMPRESS_LEVEL)"
+        exit 1
+    fi
+fi
+if [ -n "${ISSUE_TRACE_COMPRESS_THREADS}" ]; then
+    if ! [[ "${ISSUE_TRACE_COMPRESS_THREADS}" =~ ^[0-9]+$ ]]; then
+        echo "Error: --issue-trace-compress-threads must be an integer (current: $ISSUE_TRACE_COMPRESS_THREADS)"
+        exit 1
+    fi
+fi
+
+if [ -n "${STALL_REASON_PC_STATS_TOPK}" ]; then
+    if ! [[ "${STALL_REASON_PC_STATS_TOPK}" =~ ^[0-9]+$ ]]; then
+        echo "Error: --stall-reason-pc-stats-topk must be a non-negative integer (current: $STALL_REASON_PC_STATS_TOPK)"
+        exit 1
+    fi
+fi
+
+TRACE_KEY=$1
+
+# Check whether the trace key exists
+if [ -z "${TRACE_MAP[$TRACE_KEY]}" ]; then
+    echo "Error: unknown trace key '$TRACE_KEY'"
+    echo ""
+    show_usage
+    exit 1
+fi
+
+# Set the log file name (if a second argument is provided, use it as the log file name; otherwise use the trace key)
+if [ $# -gt 1 ]; then
+    LOG_NAME=$2
+else
+    LOG_NAME=$TRACE_KEY
+fi
+if [ "$NLEVEL_ENABLED" = true ]; then
+    if [ "$NLEVEL_DEFAULT_SCHEDULER" = "gto" ]; then
+        if [[ "$LOG_NAME" == *_nl_gto ]]; then
+            :
+        elif [[ "$LOG_NAME" == *_nl ]]; then
+            LOG_NAME="${LOG_NAME}_gto"
+        else
+            LOG_NAME="${LOG_NAME}_nl_gto"
+        fi
+    else
+        if [[ "$LOG_NAME" != *_nl ]]; then
+            LOG_NAME="${LOG_NAME}_nl"
+        fi
+    fi
+fi
+if [ "$IDEAL_L1D_ENABLED" = true ] && [[ "$LOG_NAME" != *_ideal_l1d ]]; then
+    LOG_NAME="${LOG_NAME}_ideal_l1d"
+fi
+if [ "$GTO_ENABLED" = true ] && [[ "$LOG_NAME" != *_gto ]]; then
+    LOG_NAME="${LOG_NAME}_gto"
+fi
+
+# Build the full trace path
+TRACE_PATH="$TRACE_BASE_DIR/${TRACE_MAP[$TRACE_KEY]}"
+
+# Check whether the trace file exists
+if [ ! -f "$TRACE_PATH" ]; then
+    echo "Error: trace file does not exist: $TRACE_PATH"
+    exit 1
+fi
+
+if [ "$NLEVEL_ENABLED" = true ]; then
+    if [ "$NLEVEL_DEFAULT_SCHEDULER" = "gto" ]; then
+        NLEVEL_WARP_ALLOC_REL="${NLEVEL_WARP_ALLOC_MAP[${TRACE_KEY}gto]}"
+        if [ -z "$NLEVEL_WARP_ALLOC_REL" ]; then
+            echo "Error: no n_level gto warp alloc file configured for trace_key=$TRACE_KEY"
+            echo "Please add the ${TRACE_KEY}gto mapping to NLEVEL_WARP_ALLOC_MAP in the script, or use --nlevel-scheduler lrr instead"
+            exit 1
+        fi
+    else
+        NLEVEL_WARP_ALLOC_REL="${NLEVEL_WARP_ALLOC_MAP[$TRACE_KEY]}"
+        if [ -z "$NLEVEL_WARP_ALLOC_REL" ]; then
+            echo "Error: no n_level warp alloc file configured for trace_key=$TRACE_KEY"
+            echo "Please add the mapping to NLEVEL_WARP_ALLOC_MAP in the script"
+            exit 1
+        fi
+    fi
+    NLEVEL_WARP_ALLOC_FILE="$BASE_DIR/$NLEVEL_WARP_ALLOC_REL"
+    if [ ! -f "$NLEVEL_WARP_ALLOC_FILE" ]; then
+        echo "Error: n_level warp alloc file does not exist: $NLEVEL_WARP_ALLOC_FILE"
+        exit 1
+    fi
+fi
+
+# Set output file names
+LOG_FILE="$RESULT_LOG_DIR/${LOG_NAME}.log"
+CSV_FILE="$RESULT_L1_DIR/${LOG_NAME}_l1.csv"
+L2_CSV_FILE="$RESULT_L2_DIR/${LOG_NAME}_l2.csv"
+ISSUE_FILE_RAW="$RESULT_ISSUE_DIR/${LOG_NAME}_issue.csv"
+ISSUE_FILE_GZ="$RESULT_ISSUE_DIR/${LOG_NAME}_issue.csv.gz"
+ISSUE_FILE_ZST="$RESULT_ISSUE_DIR/${LOG_NAME}_issue.csv.zst"
+ISSUE_FIFO_REL="result/issue_trace/${LOG_NAME}_issue.csv.fifo"
+ISSUE_FIFO_ABS="$BASE_DIR/$ISSUE_FIFO_REL"
+ISSUE_COMPRESS_LOG="$RESULT_LOG_DIR/${LOG_NAME}_issue_trace_compress.log"
+ISSUE_FILE="$ISSUE_FILE_RAW"
+BANDWIDTH_FILE="$RESULT_BW_DIR/${LOG_NAME}_hbm_partition.csv"
+ICNT_BW_FILE="$RESULT_ICNT_BW_DIR/${LOG_NAME}_icnt_bw.csv"
+L2_BW_FILE="$RESULT_L2_BW_DIR/${LOG_NAME}_l2_bw.csv"
+
+# Per-run stall reason/pc stats output directory (avoids overwriting across concurrent/multiple algorithm runs)
+RESULT_STALL_REASON_PC_STATS_DIR="$RESULT_STALL_REASON_PC_STATS_BASE_DIR/$LOG_NAME"
+mkdir -p "$RESULT_STALL_REASON_PC_STATS_DIR"
+mkdir -p "$RESULT_GRASP_TRACE_DIR"
+
+REL_L1_FILE="result/L1cache_trace/${LOG_NAME}_l1.csv"
+REL_L2_FILE="result/L2cache_trace/${LOG_NAME}_l2.csv"
+REL_ISSUE_FILE="result/issue_trace/${LOG_NAME}_issue.csv"
+REL_STALL_REASON_PC_STATS_DIR="result/issue_trace/stall_reason_pc_stats/${LOG_NAME}"
+REL_BW_FILE="result/bandwidth/${LOG_NAME}_hbm_partition.csv"
+REL_ICNT_BW_FILE="result/icnt_bw/${LOG_NAME}_icnt_bw.csv"
+REL_L2_BW_FILE="result/l2_bw/${LOG_NAME}_l2_bw.csv"
+REL_GRASP_TRACE_FILE="result/grasp_trace/${LOG_NAME}_grasp.csv"
+
+STALL_REASON_PC_STATS_BREAKDOWN="$RESULT_STALL_REASON_PC_STATS_DIR/stall_reason_breakdown.csv"
+STALL_REASON_PC_STATS_HIST="$RESULT_STALL_REASON_PC_STATS_DIR/stall_reason_pc_hist.csv"
+STALL_REASON_PC_STATS_TOPK_FILE="$RESULT_STALL_REASON_PC_STATS_DIR/stall_reason_pc_topk_other.csv"
+
+# For easier identification in the IDE: rename the stats CSVs to filenames prefixed with the log name (keep only the prefixed version)
+STALL_REASON_PC_STATS_BREAKDOWN_PREFIXED="$RESULT_STALL_REASON_PC_STATS_DIR/${LOG_NAME}_stall_reason_breakdown.csv"
+STALL_REASON_PC_STATS_HIST_PREFIXED="$RESULT_STALL_REASON_PC_STATS_DIR/${LOG_NAME}_stall_reason_pc_hist.csv"
+STALL_REASON_PC_STATS_TOPK_PREFIXED="$RESULT_STALL_REASON_PC_STATS_DIR/${LOG_NAME}_stall_reason_pc_topk_other.csv"
+
+# Create a temporary config file and update the L1 trace path
+TEMP_GPGPU_CONFIG=$(mktemp)
+ISSUE_TRACE_COMPRESS_PID=""
+ISSUE_TRACE_KEEPFD=""
+cleanup() {
+    # Close the persistent FIFO writer fd (if present), so the compressor receives EOF and exits
+    if [ -n "${ISSUE_TRACE_KEEPFD:-}" ]; then
+        exec {ISSUE_TRACE_KEEPFD}>&- 2>/dev/null || true
+        ISSUE_TRACE_KEEPFD=""
+    fi
+    # If the compressor is still running, wait for it to exit if possible; if it still hasn't exited, try to terminate it
+    if [ -n "${ISSUE_TRACE_COMPRESS_PID:-}" ]; then
+        if kill -0 "$ISSUE_TRACE_COMPRESS_PID" 2>/dev/null; then
+            wait "$ISSUE_TRACE_COMPRESS_PID" 2>/dev/null || true
+        fi
+        ISSUE_TRACE_COMPRESS_PID=""
+    fi
+    # Clean up the FIFO
+    if [ -n "${ISSUE_FIFO_ABS:-}" ] && [ -p "${ISSUE_FIFO_ABS}" ]; then
+        rm -f "$ISSUE_FIFO_ABS" 2>/dev/null || true
+    fi
+    rm -f "$TEMP_GPGPU_CONFIG" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# If issue trace streaming compression is enabled: point -issue_trace_path at the FIFO, and switch the final output path to the compressed file
+ISSUE_TRACE_COMPRESS_EFFECTIVE="$ISSUE_TRACE_COMPRESS"
+if [ "$ISSUE_TRACE_ENABLED" != true ]; then
+    ISSUE_TRACE_COMPRESS_EFFECTIVE="none"
+fi
+if [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" = "gzip" ]; then
+    REL_ISSUE_FILE="$ISSUE_FIFO_REL"
+    ISSUE_FILE="$ISSUE_FILE_GZ"
+elif [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" = "zstd" ]; then
+    REL_ISSUE_FILE="$ISSUE_FIFO_REL"
+    ISSUE_FILE="$ISSUE_FILE_ZST"
+fi
+
+# Copy the original config file and update the trace output paths (icnt/l2_bw are written/enabled by the subsequent toggle blocks)
+sed -e "s|-l1_trace_path .*|-l1_trace_path \"$REL_L1_FILE\"|g" \
+    -e "s|-l2_trace_path .*|-l2_trace_path \"$REL_L2_FILE\"|g" \
+    -e "s|-issue_trace_path .*|-issue_trace_path \"$REL_ISSUE_FILE\"|g" \
+    -e "s|-hbm_partition_trace_path .*|-hbm_partition_trace_path \"$REL_BW_FILE\"|g" \
+    -e "s|-hbm_partition_trace_enable .*|-hbm_partition_trace_enable 1|g" \
+    -e "s|-hbm_partition_trace_period .*|-hbm_partition_trace_period 1|g" \
+    "$GPGPU_CONFIG" > "$TEMP_GPGPU_CONFIG"
+
+# If the original config lacks L2 trace-related entries, fill them in (keeping the same "script controls the output path" behavior as L1/issue)
+if ! grep -q '^-l2_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+    echo "-l2_trace_enable 1" >> "$TEMP_GPGPU_CONFIG"
+fi
+if ! grep -q '^-l2_trace_path[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+    echo "-l2_trace_path \"$REL_L2_FILE\"" >> "$TEMP_GPGPU_CONFIG"
+fi
+if [ "$L2_TRACE_PRINT_BW" = true ]; then
+    if grep -q '^-l2_trace_print_bw[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-l2_trace_print_bw[[:space:]].*|-l2_trace_print_bw 1|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-l2_trace_print_bw 1" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+if [ "$L2_TRACE_PRINT_COMPUTE" = true ]; then
+    if grep -q '^-l2_trace_print_compute[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-l2_trace_print_compute[[:space:]].*|-l2_trace_print_compute 1|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-l2_trace_print_compute 1" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+if [ "$HBM_TRACE_ENABLED" = true ]; then
+    if ! grep -q '^-hbm_partition_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-hbm_partition_trace_enable 1" >> "$TEMP_GPGPU_CONFIG"
+    else
+        sed -i "s|^-hbm_partition_trace_enable[[:space:]].*|-hbm_partition_trace_enable 1|g" "$TEMP_GPGPU_CONFIG"
+    fi
+    if ! grep -q '^-hbm_partition_trace_path[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-hbm_partition_trace_path \"$REL_BW_FILE\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if ! grep -q '^-hbm_partition_trace_period[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-hbm_partition_trace_period $HBM_TRACE_PERIOD" >> "$TEMP_GPGPU_CONFIG"
+    else
+        sed -i "s|^-hbm_partition_trace_period[[:space:]].*|-hbm_partition_trace_period $HBM_TRACE_PERIOD|g" "$TEMP_GPGPU_CONFIG"
+    fi
+else
+    if grep -q '^-hbm_partition_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-hbm_partition_trace_enable[[:space:]].*|-hbm_partition_trace_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-hbm_partition_trace_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# ICNT BW trace
+if [ "$ICNT_BW_TRACE_ENABLED" = true ]; then
+    if ! grep -q '^-icnt_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-icnt_trace_enable 1" >> "$TEMP_GPGPU_CONFIG"
+    else
+        sed -i "s|^-icnt_trace_enable[[:space:]].*|-icnt_trace_enable 1|g" "$TEMP_GPGPU_CONFIG"
+    fi
+    if ! grep -q '^-icnt_trace_path[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-icnt_trace_path \"$REL_ICNT_BW_FILE\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if ! grep -q '^-icnt_trace_period[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-icnt_trace_period $ICNT_BW_TRACE_PERIOD" >> "$TEMP_GPGPU_CONFIG"
+    else
+        sed -i "s|^-icnt_trace_period[[:space:]].*|-icnt_trace_period $ICNT_BW_TRACE_PERIOD|g" "$TEMP_GPGPU_CONFIG"
+    fi
+else
+    if grep -q '^-icnt_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-icnt_trace_enable[[:space:]].*|-icnt_trace_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-icnt_trace_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# L2 BW trace
+if [ "$L2_BW_TRACE_ENABLED" = true ]; then
+    if ! grep -q '^-l2_bw_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-l2_bw_enable 1" >> "$TEMP_GPGPU_CONFIG"
+    else
+        sed -i "s|^-l2_bw_enable[[:space:]].*|-l2_bw_enable 1|g" "$TEMP_GPGPU_CONFIG"
+    fi
+    if ! grep -q '^-l2_bw_path[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-l2_bw_path \"$REL_L2_BW_FILE\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if ! grep -q '^-l2_bw_period[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        echo "-l2_bw_period $L2_BW_TRACE_PERIOD" >> "$TEMP_GPGPU_CONFIG"
+    else
+        sed -i "s|^-l2_bw_period[[:space:]].*|-l2_bw_period $L2_BW_TRACE_PERIOD|g" "$TEMP_GPGPU_CONFIG"
+    fi
+else
+    if grep -q '^-l2_bw_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-l2_bw_enable[[:space:]].*|-l2_bw_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-l2_bw_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# Ideal L1D: force eligible global reads to L1D HIT (timing upper bound).
+if [ "$IDEAL_L1D_ENABLED" = true ]; then
+    if grep -q '^[[:space:]]*-gpgpu_perfect_l1d[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^[[:space:]]*-gpgpu_perfect_l1d[[:space:]].*|-gpgpu_perfect_l1d 1|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-gpgpu_perfect_l1d 1" >> "$TEMP_GPGPU_CONFIG"
+    fi
+else
+    if grep -q '^[[:space:]]*-gpgpu_perfect_l1d[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^[[:space:]]*-gpgpu_perfect_l1d[[:space:]].*|-gpgpu_perfect_l1d 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-gpgpu_perfect_l1d 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# GRASP prefetcher: enable and configure
+if [ "$GRASP_ENABLED" = true ]; then
+    echo "-grasp_enable 1" >> "$TEMP_GPGPU_CONFIG"
+    # Default chain CSV: strict_selected_chain_instances.csv (covers BFS/SSSP/BC/SpMV)
+    if [ -z "$GRASP_CHAIN_CSV" ]; then
+        GRASP_CHAIN_CSV="$BASE_DIR/data/golden_chains/strict_selected_chain_instances.csv"
+    fi
+    if [ ! -f "$GRASP_CHAIN_CSV" ]; then
+        echo "Warning: GRASP chain CSV does not exist: $GRASP_CHAIN_CSV"
+        echo "  The GRASP pair table will be empty; only CD/CT/stride training takes effect"
+    fi
+    echo "-gpgpu_ima_prefetch_chain_csv \"$GRASP_CHAIN_CSV\"" >> "$TEMP_GPGPU_CONFIG"
+    if [ "$GRASP_DEBUG" = true ]; then
+        echo "-grasp_debug 1" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if [ "$GRASP_TRACE_ENABLED" = true ]; then
+        echo "-grasp_trace_enable 1" >> "$TEMP_GPGPU_CONFIG"
+        echo "-grasp_trace_path \"$REL_GRASP_TRACE_FILE\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if [ "$GRASP_DISTANCE" -gt 0 ] 2>/dev/null; then
+        echo "-grasp_ist_distance $GRASP_DISTANCE" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if [ "$GRASP_SPECULATIVE_STRIDE" -gt 0 ] 2>/dev/null; then
+        echo "-grasp_speculative_stride $GRASP_SPECULATIVE_STRIDE" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if [ -n "$PAIR_TABLE_SCOPE" ]; then
+        case "$PAIR_TABLE_SCOPE" in
+            warp|0)   echo "-grasp_pair_table_scope 0" >> "$TEMP_GPGPU_CONFIG" ;;
+            cta|1)    echo "-grasp_pair_table_scope 1" >> "$TEMP_GPGPU_CONFIG" ;;
+            kernel|2) echo "-grasp_pair_table_scope 2" >> "$TEMP_GPGPU_CONFIG" ;;
+            *) echo "ERROR: --pair-table-scope must be warp/cta/kernel (or 0/1/2)"; exit 1 ;;
+        esac
+    fi
+    # Pair table CSV dump: auto-enable when --grasp-debug or --grasp-trace
+    if [ "$GRASP_DEBUG" = true ] || [ "$GRASP_TRACE_ENABLED" = true ]; then
+        echo "-grasp_pair_table_dump_path \"result/grasp_trace/${LOG_NAME}_pair_table.csv\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# IMA demand tracking: load the chain CSV to identify IMA PCs even when GRASP is not enabled (used for IMA_DEMAND statistics)
+if [ "$GRASP_ENABLED" != true ]; then
+    IMA_CHAIN_CSV="${GRASP_CHAIN_CSV:-$BASE_DIR/data/golden_chains/strict_selected_chain_instances.csv}"
+    if [ -f "$IMA_CHAIN_CSV" ]; then
+        echo "-gpgpu_ima_prefetch_chain_csv \"$IMA_CHAIN_CSV\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# Extra simulation arguments (--sim-args): appended raw to gpgpusim config
+if [ -n "$EXTRA_SIM_ARGS" ]; then
+    echo "$EXTRA_SIM_ARGS" >> "$TEMP_GPGPU_CONFIG"
+fi
+
+# trace enable toggles (default matches the original config; overridable here from the command line)
+if [ "$ISSUE_TRACE_ENABLED" = true ]; then
+    sed -i "s|^-issue_trace_enable[[:space:]].*|-issue_trace_enable 1|g" "$TEMP_GPGPU_CONFIG" || true
+else
+    if grep -q '^-issue_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-issue_trace_enable[[:space:]].*|-issue_trace_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-issue_trace_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if grep -q '^-issue_trace_path[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-issue_trace_path[[:space:]].*|-issue_trace_path \"\"|g" "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# Lightweight stall reason / pc statistics (output uses fixed filenames, in a subdirectory under issue_trace)
+if [ "$STALL_REASON_PC_STATS_ENABLED" = true ]; then
+    if grep -q '^-stall_reason_pc_stats_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-stall_reason_pc_stats_enable[[:space:]].*|-stall_reason_pc_stats_enable 1|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-stall_reason_pc_stats_enable 1" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if grep -q '^-stall_reason_pc_stats_path[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-stall_reason_pc_stats_path[[:space:]].*|-stall_reason_pc_stats_path \"$REL_STALL_REASON_PC_STATS_DIR\"|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-stall_reason_pc_stats_path \"$REL_STALL_REASON_PC_STATS_DIR\"" >> "$TEMP_GPGPU_CONFIG"
+    fi
+    if grep -q '^-stall_reason_pc_stats_topk[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-stall_reason_pc_stats_topk[[:space:]].*|-stall_reason_pc_stats_topk $STALL_REASON_PC_STATS_TOPK|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-stall_reason_pc_stats_topk $STALL_REASON_PC_STATS_TOPK" >> "$TEMP_GPGPU_CONFIG"
+    fi
+else
+    if grep -q '^-stall_reason_pc_stats_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-stall_reason_pc_stats_enable[[:space:]].*|-stall_reason_pc_stats_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-stall_reason_pc_stats_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+if [ "$L1_TRACE_ENABLED" = true ]; then
+    sed -i "s|^-l1_trace_enable[[:space:]].*|-l1_trace_enable 1|g" "$TEMP_GPGPU_CONFIG" || true
+else
+    if grep -q '^-l1_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-l1_trace_enable[[:space:]].*|-l1_trace_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-l1_trace_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+if [ "$L2_TRACE_ENABLED" = true ]; then
+    sed -i "s|^-l2_trace_enable[[:space:]].*|-l2_trace_enable 1|g" "$TEMP_GPGPU_CONFIG" || true
+else
+    if grep -q '^-l2_trace_enable[[:space:]]' "$TEMP_GPGPU_CONFIG"; then
+        sed -i "s|^-l2_trace_enable[[:space:]].*|-l2_trace_enable 0|g" "$TEMP_GPGPU_CONFIG"
+    else
+        echo "-l2_trace_enable 0" >> "$TEMP_GPGPU_CONFIG"
+    fi
+fi
+
+# Early termination (reduces simulation/output volume; 0 means unlimited)
+if [ "${MAX_CYCLE:-0}" != "0" ] || [ "${MAX_INSN:-0}" != "0" ] || [ "${MAX_CTA:-0}" != "0" ] || [ "${MAX_COMPLETED_CTA:-0}" != "0" ]; then
+    sed -i "/^[[:space:]]*-gpgpu_max_cycle[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_max_insn[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_max_cta[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_max_completed_cta[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    {
+        echo "-gpgpu_max_cycle $MAX_CYCLE"
+        echo "-gpgpu_max_insn $MAX_INSN"
+        echo "-gpgpu_max_cta $MAX_CTA"
+        echo "-gpgpu_max_completed_cta $MAX_COMPLETED_CTA"
+    } >> "$TEMP_GPGPU_CONFIG"
+fi
+
+if [ "$NLEVEL_ENABLED" = true ]; then
+    sed -i "/^[[:space:]]*-gpgpu_scheduler[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_n_level_warp_alloc_file[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_n_level_default_scheduler[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    {
+        echo "-gpgpu_scheduler n_level"
+        echo "-gpgpu_n_level_warp_alloc_file \"$NLEVEL_WARP_ALLOC_FILE\""
+        echo "-gpgpu_n_level_default_scheduler $NLEVEL_DEFAULT_SCHEDULER"
+    } >> "$TEMP_GPGPU_CONFIG"
+fi
+
+if [ "$GTO_ENABLED" = true ]; then
+    sed -i "/^[[:space:]]*-gpgpu_scheduler[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_n_level_warp_alloc_file[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    sed -i "/^[[:space:]]*-gpgpu_n_level_default_scheduler[[:space:]]/d" "$TEMP_GPGPU_CONFIG"
+    {
+        echo "-gpgpu_scheduler gto"
+    } >> "$TEMP_GPGPU_CONFIG"
+fi
+
+# Debug info: show the updated trace output paths
+echo "The L1 trace path in the config file has been updated to: $CSV_FILE"
+echo "The HBM partition bandwidth trace path in the config file has been updated to: $BANDWIDTH_FILE"
+if [ "$ICNT_BW_TRACE_ENABLED" = true ]; then
+    echo "The ICNT bandwidth trace path in the config file has been updated to: $ICNT_BW_FILE"
+fi
+if [ "$L2_BW_TRACE_ENABLED" = true ]; then
+    echo "The L2 bandwidth trace path in the config file has been updated to: $L2_BW_FILE"
+fi
+if [ "$NLEVEL_ENABLED" = true ]; then
+    echo "n_level scheduler enabled: $NLEVEL_WARP_ALLOC_FILE (default=$NLEVEL_DEFAULT_SCHEDULER)"
+fi
+if [ "$GTO_ENABLED" = true ]; then
+    echo "gto scheduler enabled"
+fi
+
+# Show run information
+echo "=========================================="
+echo "Running the Accel-Sim simulator"
+echo "=========================================="
+echo "Config model: $CONFIG_MODEL"
+echo "Trace key: $TRACE_KEY"
+echo "Trace path: $TRACE_PATH"
+echo "Log file name: $LOG_NAME"
+echo "Log file: $LOG_FILE"
+echo "CSV file: $CSV_FILE"
+echo "L2 CSV file: $L2_CSV_FILE"
+if [ "$ISSUE_TRACE_ENABLED" = true ]; then
+    echo "Issue CSV file: $ISSUE_FILE"
+else
+    echo "Issue CSV file: (disabled)"
+fi
+if [ "$STALL_REASON_PC_STATS_ENABLED" = true ]; then
+    echo "Stall reason/PC stats dir: $RESULT_STALL_REASON_PC_STATS_DIR"
+fi
+echo "HBM partition bandwidth CSV file: $BANDWIDTH_FILE"
+if [ "$ICNT_BW_TRACE_ENABLED" = true ]; then
+    echo "ICNT bandwidth CSV file: $ICNT_BW_FILE"
+fi
+if [ "$L2_BW_TRACE_ENABLED" = true ]; then
+    echo "L2 bandwidth CSV file: $L2_BW_FILE"
+fi
+if [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" != "none" ]; then
+    echo "Issue trace compression: $ISSUE_TRACE_COMPRESS_EFFECTIVE (level=${ISSUE_TRACE_COMPRESS_LEVEL:-default}, threads=${ISSUE_TRACE_COMPRESS_THREADS})"
+    echo "Issue trace compression log: $ISSUE_COMPRESS_LOG"
+fi
+if [ "$NLEVEL_ENABLED" = true ]; then
+    echo "n_level warp alloc: $NLEVEL_WARP_ALLOC_FILE"
+    echo "n_level default scheduler: $NLEVEL_DEFAULT_SCHEDULER"
+fi
+if [ "$GTO_ENABLED" = true ]; then
+    echo "scheduler: gto"
+fi
+if [ "$GRASP_ENABLED" = true ]; then
+    echo "GRASP prefetcher: enabled"
+    echo "  Chain CSV: ${GRASP_CHAIN_CSV:-$BASE_DIR/data/golden_chains/strict_selected_chain_instances.csv}"
+    echo "  IST Distance: ${GRASP_DISTANCE:-1 (default)}"
+    echo "  (other parameters use default values; see the GRASP_CONFIG line in the log)"
+else
+    echo "GRASP prefetcher: disabled"
+fi
+echo "=========================================="
+
+# Start issue trace streaming compression (must complete before accel-sim starts, otherwise issue_tracer opening the FIFO will block)
+if [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" != "none" ]; then
+    if [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" = "zstd" ] && ! command -v zstd >/dev/null 2>&1; then
+        echo "Error: zstd compression was selected but the zstd command was not found on the system. Please install zstd or use --issue-trace-compress gzip instead"
+        exit 1
+    fi
+
+    rm -f "$ISSUE_FIFO_ABS" 2>/dev/null || true
+    mkfifo "$ISSUE_FIFO_ABS"
+
+    rm -f "$ISSUE_FILE" 2>/dev/null || true
+    rm -f "$ISSUE_COMPRESS_LOG" 2>/dev/null || true
+
+    if [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" = "gzip" ]; then
+        level="${ISSUE_TRACE_COMPRESS_LEVEL:-1}"
+        (
+            gzip -"${level}" -c < "$ISSUE_FIFO_ABS" > "$ISSUE_FILE"
+        ) 2> "$ISSUE_COMPRESS_LOG" &
+        ISSUE_TRACE_COMPRESS_PID=$!
+    else
+        level="${ISSUE_TRACE_COMPRESS_LEVEL:-3}"
+        threads="${ISSUE_TRACE_COMPRESS_THREADS:-1}"
+        (
+            zstd -T"${threads}" -"${level}" -c < "$ISSUE_FIFO_ABS" > "$ISSUE_FILE"
+        ) 2> "$ISSUE_COMPRESS_LOG" &
+        ISSUE_TRACE_COMPRESS_PID=$!
+    fi
+
+    # Persistent writer fd: prevents issue_tracer's per-flush open/close from causing the compressor to see EOF and exit early
+    exec {ISSUE_TRACE_KEEPFD}> "$ISSUE_FIFO_ABS"
+fi
+
+# Make sure LD_LIBRARY_PATH and other environment variables are set (otherwise the system libcudart may be loaded by mistake, causing missing symbols)
+if [ -z "${ACCELSIM_SETUP_ENVIRONMENT_WAS_RUN:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$BASE_DIR/gpu-simulator/setup_environment.sh" release || {
+        echo "Error: setup_environment.sh failed. Please run the following manually in the current shell first:"
+        echo "  source gpu-simulator/setup_environment.sh release"
+        exit 1
+    }
+fi
+
+# Run the simulator
+(
+    cd "$BASE_DIR" || exit 1
+    "$ACCEL_SIM_BIN" \
+    -trace "$TRACE_PATH" \
+    -config "$TRACE_CONFIG" \
+    -config "$TEMP_GPGPU_CONFIG"
+) |& tee "$LOG_FILE"
+
+# Check the run result
+if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    # Finish issue trace compression: close the persistent writer fd and wait for the compressor to exit, to ensure the compressed file is complete
+    if [ "$ISSUE_TRACE_COMPRESS_EFFECTIVE" != "none" ]; then
+        exec {ISSUE_TRACE_KEEPFD}>&- 2>/dev/null || true
+        ISSUE_TRACE_KEEPFD=""
+        if [ -n "${ISSUE_TRACE_COMPRESS_PID:-}" ]; then
+            if ! wait "$ISSUE_TRACE_COMPRESS_PID"; then
+                echo "[warn] issue trace compression process exited abnormally (partial output can still be checked): pid=$ISSUE_TRACE_COMPRESS_PID"
+                echo "[warn] compression log: $ISSUE_COMPRESS_LOG"
+            fi
+            ISSUE_TRACE_COMPRESS_PID=""
+        fi
+        rm -f "$ISSUE_FIFO_ABS" 2>/dev/null || true
+    fi
+
+    # Lightweight stall stats: after the simulation ends, rename the fixed filenames to prefixed filenames (avoids identically-named files being hard to distinguish in an IDE)
+    if [ "$STALL_REASON_PC_STATS_ENABLED" = true ]; then
+        if [ -f "$STALL_REASON_PC_STATS_BREAKDOWN" ]; then
+            mv -f "$STALL_REASON_PC_STATS_BREAKDOWN" "$STALL_REASON_PC_STATS_BREAKDOWN_PREFIXED"
+        fi
+        if [ -f "$STALL_REASON_PC_STATS_HIST" ]; then
+            mv -f "$STALL_REASON_PC_STATS_HIST" "$STALL_REASON_PC_STATS_HIST_PREFIXED"
+        fi
+        if [ "${STALL_REASON_PC_STATS_TOPK:-0}" != "0" ] && [ -f "$STALL_REASON_PC_STATS_TOPK_FILE" ]; then
+            mv -f "$STALL_REASON_PC_STATS_TOPK_FILE" "$STALL_REASON_PC_STATS_TOPK_PREFIXED"
+        fi
+
+        # Update the variables so subsequent printing/plotting use the prefixed paths
+        STALL_REASON_PC_STATS_BREAKDOWN="$STALL_REASON_PC_STATS_BREAKDOWN_PREFIXED"
+        STALL_REASON_PC_STATS_HIST="$STALL_REASON_PC_STATS_HIST_PREFIXED"
+        STALL_REASON_PC_STATS_TOPK_FILE="$STALL_REASON_PC_STATS_TOPK_PREFIXED"
+    fi
+
+    # ── Experiment completeness verification ──────────────────────────────────────────────
+    verify_completion() {
+        local log_file="$1"
+        local trace_path="$2"
+
+        # 1. Check the exit flag
+        local exit_ok=false
+        if grep -q "exit detected" "$log_file"; then
+            exit_ok=true
+        fi
+
+        # 2. Count the number of completed kernels (gpu_tot_ipc appears once each time a kernel finishes)
+        local completed_kernels
+        completed_kernels=$(grep -c "gpu_tot_ipc" "$log_file" 2>/dev/null || echo 0)
+
+        # 3. Count the expected number of kernels from the trace directory
+        local trace_dir
+        trace_dir=$(dirname "$trace_path")
+        local expected_kernels
+        expected_kernels=$(find "$trace_dir" -maxdepth 1 -name 'kernel-*.traceg*' 2>/dev/null | wc -l)
+
+        # 4. Extract the final IPC and cycles
+        local final_ipc final_cycles
+        final_ipc=$(grep "gpu_tot_ipc" "$log_file" | tail -1 | awk '{print $NF}')
+        final_cycles=$(grep "gpu_tot_sim_cycle" "$log_file" | tail -1 | awk -F'=' '{print $2}' | tr -d ' ')
+
+        # 5. Determine the status
+        local status
+        if [ "$exit_ok" = true ] && [ "$completed_kernels" -eq "$expected_kernels" ] 2>/dev/null; then
+            status="COMPLETE"
+        elif [ "$exit_ok" = true ]; then
+            status="PARTIAL (${completed_kernels}/${expected_kernels} kernels)"
+        else
+            status="CRASHED"
+        fi
+
+        # 6. Extract IMA demand statistics (present in both baseline and GRASP)
+        local ima_demand_line grasp_ima_misses="" ima_timeliness_line=""
+        ima_demand_line=$(grep "^IMA_DEMAND:" "$log_file" | tail -1)
+        ima_timeliness_line=$(grep "^IMA_TIMELINESS:" "$log_file" | tail -1)
+        if [ -n "$ima_demand_line" ]; then
+            grasp_ima_misses=$(echo "$ima_demand_line" | grep -oP 'data_misses=\K[0-9]+')
+        fi
+
+        # 7. Extract GRASP metrics (aggregated across all SMs, GRASP mode only)
+        local grasp_effect="" grasp_storage="" grasp_rfail="" grasp_funnel="" coverage_str=""
+        if [ "$GRASP_ENABLED" = true ]; then
+            # GRASP_EFFECT: cumulative counter -> take the last value per SM, sum across all SMs
+            grasp_effect=$(grep "^GRASP_EFFECT SM" "$log_file" | awk '{
+                split($2,a,":"); gsub(/SM/,"",a[1]); sm=a[1]
+                for(i=3;i<=NF;i++){split($i,kv,"=")
+                    if(kv[1]=="pf_useful")useful[sm]=kv[2]+0
+                    if(kv[1]=="pf_useless")useless[sm]=kv[2]+0
+                    if(kv[1]=="pf_late")late[sm]=kv[2]+0}
+            } END {tu=0;ts=0;tl=0
+                for(s in useful){tu+=useful[s];ts+=useless[s];tl+=late[s]}
+                printf "pf_useful=%d pf_useless=%d pf_late=%d",tu,ts,tl
+                if(tu+ts>0)printf " accuracy=%.2f%%",100.0*tu/(tu+ts)}')
+
+            # GRASP_STORAGE: take the maximum of the peak values across SMs
+            grasp_storage=$(grep "^GRASP_STORAGE SM" "$log_file" | awk '{
+                for(i=3;i<=NF;i++){
+                    if($i~/^prb=/){split($i,a,"/");gsub(/prb=/,"",a[1]);split(a[2],b,"(")
+                        if(a[1]+0>pp){pp=a[1]+0;pc=b[1]+0}}
+                    if($i~/^ct=/){split($i,a,"/");gsub(/ct=/,"",a[1]);split(a[2],b,"(")
+                        if(a[1]+0>cp){cp=a[1]+0;cc=b[1]+0}}
+                    if($i~/^cd_fifo=/){split($i,a,"/");gsub(/cd_fifo=/,"",a[1]);split(a[2],b,"(")
+                        if(a[1]+0>dp){dp=a[1]+0;dc=b[1]+0}}
+                    if($i~/^pf_queue_peak=/){split($i,a,"=");if(a[2]+0>qp)qp=a[2]+0}}
+            } END {printf "prb=%d/%d(%.1f%%) ct=%d/%d(%.1f%%) cd_fifo=%d/%d(%.1f%%) pf_queue_peak=%d",
+                pp,pc,(pc>0?100.0*pp/pc:0),cp,cc,(cc>0?100.0*cp/cc:0),dp,dc,(dc>0?100.0*dp/dc:0),qp}')
+
+            # GRASP_RFAIL: recover absolute counts from percentages, sum across all SMs, then recompute the percentage
+            grasp_rfail=$(grep "^GRASP_RFAIL SM" "$log_file" | awk '{
+                split($2,a,":"); gsub(/SM/,"",a[1]); sm=a[1]
+                for(i=3;i<=NF;i++){split($i,kv,"=")
+                    if(kv[1]=="total")tot[sm]=kv[2]+0}
+                if(tot[sm]>0){
+                    for(i=3;i<=NF;i++){split($i,kv,"=");gsub(/%/,"",kv[2])
+                        if(kv[1]=="line_alloc")la[sm]=int(kv[2]*tot[sm]/100+0.5)
+                        if(kv[1]=="missq")mq[sm]=int(kv[2]*tot[sm]/100+0.5)
+                        if(kv[1]=="mshr_entry")me[sm]=int(kv[2]*tot[sm]/100+0.5)
+                        if(kv[1]=="mshr_merge")mm[sm]=int(kv[2]*tot[sm]/100+0.5)
+                        if(kv[1]=="rw_pending")rw[sm]=int(kv[2]*tot[sm]/100+0.5)}
+                }
+            } END {tt=0;tla=0;tmq=0;tme=0;tmm=0;trw=0
+                for(s in tot){tt+=tot[s];tla+=la[s];tmq+=mq[s];tme+=me[s];tmm+=mm[s];trw+=rw[s]}
+                printf "total=%d",tt
+                if(tt>0)printf " line_alloc=%.1f%% missq=%.1f%% mshr_entry=%.1f%% mshr_merge=%.1f%% rw_pending=%.1f%%",
+                    100.0*tla/tt,100.0*tmq/tt,100.0*tme/tt,100.0*tmm/tt,100.0*trw/tt}')
+
+            # GRASP_FUNNEL: absolute counts summed across all SMs
+            grasp_funnel=$(grep "^GRASP_FUNNEL SM" "$log_file" | awk '{
+                split($2,a,":"); gsub(/SM/,"",a[1]); sm=a[1]
+                for(i=3;i<=NF;i++){
+                    n=$i; gsub(/\(.*\)/,"",n); split(n,kv,"=")
+                    if(kv[1]=="idx_attempted")ia[sm]=kv[2]+0
+                    if(kv[1]=="idx_rfail")irf[sm]=kv[2]+0
+                    if(kv[1]=="idx_got_data")igd[sm]=kv[2]+0
+                    if(kv[1]=="data_enqueued")de[sm]=kv[2]+0
+                    if(kv[1]=="data_throttled")dt[sm]=kv[2]+0
+                    if(kv[1]=="data_attempted")da[sm]=kv[2]+0
+                    if(kv[1]=="data_rfail")drf[sm]=kv[2]+0
+                    if(kv[1]=="data_got_data")dgd[sm]=kv[2]+0}
+            } END {tia=0;tirf=0;tigd=0;tde=0;tdt=0;tda=0;tdrf=0;tdgd=0
+                for(s in ia){tia+=ia[s];tirf+=irf[s];tigd+=igd[s];tde+=de[s];tdt+=dt[s];tda+=da[s];tdrf+=drf[s];tdgd+=dgd[s]}
+                printf "idx_attempted=%d idx_rfail=%d",tia,tirf
+                if(tia>0)printf "(%.1f%%)",100.0*tirf/tia
+                printf " idx_got_data=%d | data_enqueued=%d data_throttled=%d data_attempted=%d data_rfail=%d",tigd,tde,tdt,tda,tdrf
+                if(tda>0)printf "(%.1f%%)",100.0*tdrf/tda
+                printf " data_got_data=%d",tdgd}')
+
+            # GRASP_BOTTLENECK: theoretical vs actual, absolute counts summed across all SMs
+            grasp_bottleneck=$(grep "^GRASP_BOTTLENECK SM" "$log_file" | awk '{
+                split($2,a,":"); gsub(/SM/,"",a[1]); sm=a[1]
+                for(i=3;i<=NF;i++){
+                    if($i=="|") continue
+                    split($i,kv,"=")
+                    if(kv[1]=="idx_theory")it[sm]=kv[2]+0
+                    if(kv[1]=="idx_generated")ig[sm]=kv[2]+0
+                    if(kv[1]=="idx_accepted")iac[sm]=kv[2]+0
+                    if(kv[1]=="idx_rfail")irf[sm]=kv[2]+0
+                    if(kv[1]=="idx_retried")ire[sm]=kv[2]+0
+                    if(kv[1]=="data_theory")dt[sm]=kv[2]+0
+                    if(kv[1]=="data_enqueued")deq[sm]=kv[2]+0
+                    if(kv[1]=="data_accepted")dac[sm]=kv[2]+0
+                    if(kv[1]=="data_rfail")drf[sm]=kv[2]+0
+                    if(kv[1]=="data_retried")dre[sm]=kv[2]+0
+                    if(kv[1]=="tc_suppressed")tcs[sm]=kv[2]+0
+                    if(kv[1]=="no_throttle")nt[sm]=kv[2]+0}
+            } END {tit=0;tig=0;tiac=0;tirf=0;tire=0;tdt=0;tdeq=0;tdac=0;tdrf=0;tdre=0;ttcs=0;tnt=0
+                for(s in it){tit+=it[s];tig+=ig[s];tiac+=iac[s];tirf+=irf[s];tire+=ire[s];
+                             tdt+=dt[s];tdeq+=deq[s];tdac+=dac[s];tdrf+=drf[s];tdre+=dre[s];
+                             ttcs+=tcs[s];tnt=nt[s]}
+                printf "idx_theory=%d idx_generated=%d idx_accepted=%d",tit,tig,tiac
+                if(tit>0)printf "(%.1f%%)",100.0*tiac/tit
+                printf " idx_rfail=%d idx_retried=%d | data_theory=%d data_enqueued=%d data_accepted=%d",tirf,tire,tdt,tdeq,tdac
+                if(tdt>0)printf "(%.1f%%)",100.0*tdac/tdt
+                printf " data_rfail=%d data_retried=%d | tc_suppressed=%d no_throttle=%d",tdrf,tdre,ttcs,tnt}')
+
+            # 8. Compute coverage = 1 - grasp_data_misses / baseline_data_misses
+            local registry="$BASE_DIR/result/baseline_registry.csv"
+            if [ -f "$registry" ] && [ -n "$grasp_ima_misses" ]; then
+                local baseline_ima_misses
+                baseline_ima_misses=$(grep "^${TRACE_KEY},${CONFIG_MODEL}," "$registry" | head -1 | cut -d, -f6)
+                if [ -n "$baseline_ima_misses" ] && [ "$baseline_ima_misses" -gt 0 ] 2>/dev/null; then
+                    coverage_str=$(awk -v g="$grasp_ima_misses" -v b="$baseline_ima_misses" \
+                        'BEGIN { printf "%.2f%%", (1 - g/b) * 100 }')
+                fi
+            fi
+        fi
+
+        # 7. Write EXPERIMENT SUMMARY to the end of the log
+        {
+            echo ""
+            echo "=== EXPERIMENT SUMMARY ==="
+            echo "trace_key=$TRACE_KEY"
+            echo "config=$CONFIG_MODEL"
+            echo "grasp_enabled=$GRASP_ENABLED"
+            echo "expected_kernels=$expected_kernels"
+            echo "completed_kernels=$completed_kernels"
+            echo "final_ipc=$final_ipc"
+            echo "final_cycles=$final_cycles"
+            echo "status=$status"
+            if [ -n "$ima_demand_line" ]; then
+                echo "ima_demand: $ima_demand_line"
+            fi
+            if [ -n "$grasp_effect" ]; then
+                echo "--- GRASP Metrics (All SMs) ---"
+                echo "effect: $grasp_effect"
+                echo "storage(max): $grasp_storage"
+                echo "rfail: $grasp_rfail"
+                echo "funnel: $grasp_funnel"
+                if [ -n "$grasp_bottleneck" ]; then
+                    echo "bottleneck: $grasp_bottleneck"
+                fi
+                if [ -n "$ima_timeliness_line" ]; then
+                    echo "timeliness: $ima_timeliness_line"
+                fi
+                if [ -n "$coverage_str" ]; then
+                    echo "coverage=$coverage_str (1 - grasp_data_misses/baseline_data_misses)"
+                fi
+            fi
+            echo "=== END SUMMARY ==="
+        } >> "$log_file"
+
+        # Print the summary to the terminal
+        echo ""
+        echo "── Experiment completeness verification ──"
+        echo "  Expected kernels: $expected_kernels"
+        echo "  Completed kernels: $completed_kernels"
+        echo "  Final IPC: $final_ipc"
+        echo "  Final cycles: $final_cycles"
+        echo "  Status: $status"
+        if [ "$GRASP_ENABLED" = true ] && [ -n "$grasp_effect" ]; then
+            echo "  ── GRASP Metrics (All SMs) ──"
+            echo "  $grasp_effect"
+            echo "  storage(max): $grasp_storage"
+            echo "  rfail: $grasp_rfail"
+            echo "  funnel: $grasp_funnel"
+            if [ -n "$grasp_bottleneck" ]; then
+                echo "  bottleneck: $grasp_bottleneck"
+            fi
+            if [ -n "$ima_timeliness_line" ]; then
+                echo "  timeliness: $ima_timeliness_line"
+            fi
+            if [ -n "$coverage_str" ]; then
+                echo "  coverage: $coverage_str"
+            fi
+        fi
+        if [ "$status" != "COMPLETE" ]; then
+            echo "  ⚠ The experiment did not complete fully! The results may be inaccurate."
+        fi
+        echo "────────────────────"
+    }
+
+    verify_completion "$LOG_FILE" "$TRACE_PATH"
+
+    # ── Baseline Registry auto-update ─────────────────────────────────
+    update_baseline_registry() {
+        local log_file="$1"
+        local registry="$BASE_DIR/result/baseline_registry.csv"
+
+        # Only write when not in GRASP mode (baseline)
+        if [ "$GRASP_ENABLED" = true ]; then return; fi
+
+        # Extract data from EXPERIMENT SUMMARY
+        local status
+        status=$(grep "^status=" "$log_file" | tail -1 | cut -d= -f2)
+
+        # Only write to the registry when status is COMPLETE
+        if [ "$status" != "COMPLETE" ]; then
+            echo "[baseline-registry] Experiment not complete (status=$status), skipping write"
+            return
+        fi
+
+        local final_ipc completed_kernels final_cycles
+        final_ipc=$(grep "^final_ipc=" "$log_file" | tail -1 | cut -d= -f2)
+        completed_kernels=$(grep "^completed_kernels=" "$log_file" | tail -1 | cut -d= -f2)
+        final_cycles=$(grep "^final_cycles=" "$log_file" | tail -1 | cut -d= -f2)
+
+        # Extract IMA demand misses (from the IMA_DEMAND: line)
+        local ima_misses
+        ima_misses=$(grep "^IMA_DEMAND:" "$log_file" | tail -1 | grep -oP 'total_misses=\K[0-9]+' || echo "0")
+
+        local git_commit
+        git_commit=$(git -C "$BASE_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        local today
+        today=$(date +%F)
+
+        # Create the header (first time only)
+        if [ ! -f "$registry" ]; then
+            echo "trace_key,config,kernels,final_ipc,final_cycles,ima_misses,log_file,git_commit,date" > "$registry"
+        fi
+
+        # Remove the old entry with the same trace_key+config, then write the new entry
+        local tmp_reg="${registry}.tmp"
+        head -1 "$registry" > "$tmp_reg"
+        tail -n +2 "$registry" | grep -v "^${TRACE_KEY},${CONFIG_MODEL}," >> "$tmp_reg" 2>/dev/null || true
+        echo "${TRACE_KEY},${CONFIG_MODEL},${completed_kernels},${final_ipc},${final_cycles},${ima_misses},$(basename "$log_file"),${git_commit},${today}" >> "$tmp_reg"
+        mv "$tmp_reg" "$registry"
+
+        echo "[baseline-registry] Updated: ${TRACE_KEY} (IPC=${final_ipc}, ima_misses=${ima_misses})"
+    }
+
+    update_baseline_registry "$LOG_FILE"
+
+    echo ""
+    echo "=========================================="
+    echo "Simulation complete!"
+    echo "Results saved to:"
+    echo "  Log: $LOG_FILE"
+    echo "  CSV: $CSV_FILE"
+    echo "  L2 CSV: $L2_CSV_FILE"
+    if [ "$ISSUE_TRACE_ENABLED" = true ]; then
+        echo "  Issue trace: $ISSUE_FILE"
+    else
+        echo "  Issue trace: (disabled)"
+    fi
+    if [ "$STALL_REASON_PC_STATS_ENABLED" = true ]; then
+        echo "  Stall reason/PC stats dir: $RESULT_STALL_REASON_PC_STATS_DIR"
+        echo "    - $STALL_REASON_PC_STATS_BREAKDOWN"
+        echo "    - $STALL_REASON_PC_STATS_HIST"
+        if [ "${STALL_REASON_PC_STATS_TOPK:-0}" != "0" ]; then
+            echo "    - $STALL_REASON_PC_STATS_TOPK_FILE"
+        fi
+    else
+        echo "  Stall reason/PC stats: (disabled)"
+    fi
+    echo "  HBM partition bandwidth CSV: $BANDWIDTH_FILE"
+    if [ "$ICNT_BW_TRACE_ENABLED" = true ]; then
+        echo "  ICNT bandwidth CSV: $ICNT_BW_FILE"
+    fi
+    if [ "$L2_BW_TRACE_ENABLED" = true ]; then
+        echo "  L2 bandwidth CSV: $L2_BW_FILE"
+    fi
+    echo "=========================================="
+
+    if [ "$PLOT_ENABLED" = true ]; then
+        PLOT_SCRIPT="$BASE_DIR/result/plot/run_plots.sh"
+        if [ ! -x "$PLOT_SCRIPT" ]; then
+            echo "[warn] Plot script not found or not executable: $PLOT_SCRIPT"
+        else
+            echo ""
+            echo "=========================================="
+            echo "Starting plotting..."
+            echo "=========================================="
+            PLOT_ARGS=(--log-name "$LOG_NAME" --format "$PLOT_FORMAT" --backend "$PLOT_BACKEND")
+            if [ "$PLOT_BACKEND" = "local" ]; then
+                if [ "$PLOT_BACKGROUND" = true ]; then
+                    PLOT_ARGS+=(--background)
+                fi
+            else
+                if [ -n "$PLOT_SESSION" ]; then
+                    PLOT_ARGS+=(--session "$PLOT_SESSION")
+                fi
+                if [ "$PLOT_KILL_EXISTING" = true ]; then
+                    PLOT_ARGS+=(--kill-existing)
+                fi
+                if [ "$PLOT_ATTACH" = true ]; then
+                    PLOT_ARGS+=(--attach)
+                fi
+                if [ "$PLOT_TMUX_AUTO_CLOSE" = true ]; then
+                    PLOT_ARGS+=(--auto-close)
+                fi
+                if [ "$PLOT_TMUX_MONITOR" = true ]; then
+                    PLOT_ARGS+=(--monitor)
+                fi
+            fi
+
+            if ! "$PLOT_SCRIPT" "${PLOT_ARGS[@]}"; then
+                echo "[warn] Failed to start plotting (does not affect the simulation results). Please run manually:"
+                echo "  $PLOT_SCRIPT --log-name $LOG_NAME --format $PLOT_FORMAT --backend $PLOT_BACKEND"
+            fi
+        fi
+    fi
+else
+    echo ""
+    echo "=========================================="
+    echo "Simulation run failed, please check the log file: $LOG_FILE"
+    echo "=========================================="
+    exit 1
+fi
