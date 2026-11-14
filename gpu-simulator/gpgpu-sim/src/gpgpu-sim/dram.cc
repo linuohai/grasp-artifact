@@ -783,7 +783,7 @@ void dram_t::print(FILE *simFile) const {
   fprintf(simFile, "dram_util_bins:");
   for (i = 0; i < 10; i++) fprintf(simFile, " %d", dram_util_bins[i]);
   fprintf(simFile, "\n");
-  // SC.2: machine-parseable bins for sim-vs-real-MAPE parser.
+  // machine-parseable bins for sim-vs-real-MAPE parser.
   // Bin i represents cycles where DRAM util fell in [10i%, 10(i+1)%) range.
   // Parser computes effective util = sum((10i+5) * bins[i]) / total.
   {
@@ -827,7 +827,7 @@ void dram_t::print_stat(FILE *simFile) {
   fprintf(simFile, "dram_util_bins:");
   for (unsigned i = 0; i < 10; i++) fprintf(simFile, " %d", dram_util_bins[i]);
   fprintf(simFile, "\n");
-  // SC.2: machine-parseable bins for sim-vs-real-MAPE parser.
+  // machine-parseable bins for sim-vs-real-MAPE parser.
   // Bin i represents cycles where DRAM util fell in [10i%, 10(i+1)%) range.
   // Parser computes effective util = sum((10i+5) * bins[i]) / total.
   {

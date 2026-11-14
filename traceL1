@@ -377,7 +377,7 @@ declare -A TRACE_MAP=(
     ["bfs_cit"]="bfs_linear_base/mtx___data_cit_Patents_0_0_0/traces/kernelslist.g"
     # IMA configuration (cit-Patents, symmetrize=1, source=3569341)
     ["bfs_cit_ima"]="bfs_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
-    # IMA tiers (aligned with define-all-apps.yml; source sensitive)
+    # IMA tiers (source sensitive)
     ["bfs_ima_high"]="bfs_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
     ["bfs_ima_med"]="bfs_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
     ["bfs_ima_small"]="bfs_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
@@ -393,7 +393,7 @@ declare -A TRACE_MAP=(
     # IMA configuration (cit-Patents, symmetrize=1)
     ["spmv_cit_ima"]="spmv_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
 
-    # IMA tiers (aligned with define-all-apps.yml; source sensitive)
+    # IMA tiers (source sensitive)
     ["sssp_ima_high"]="sssp_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
     ["sssp_ima_med"]="sssp_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
     ["sssp_ima_small"]="sssp_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
@@ -404,13 +404,13 @@ declare -A TRACE_MAP=(
     ["tc"]="tc_gpu_base/__data_web_Google/traces/kernelslist.g"
 
     ["cc"]="cc_base/mtx___data_web_Google_1_1/traces/kernelslist.g"
-    # IMA tiers (aligned with define-all-apps.yml; direction sensitive)
+    # IMA tiers (direction sensitive)
     ["cc_ima_high"]="cc_base/mtx___data_cit_Patents_1_0/traces/kernelslist.g"
     ["cc_ima_med"]="cc_base/mtx___data_web_Google_1_0/traces/kernelslist.g"
     ["cc_ima_small"]="cc_base/mtx___data_web_Google_0_0/traces/kernelslist.g"
 
     ["bc"]="bc_linear_base/mtx___data_web_Google_0/traces/kernelslist.g"
-    # IMA tiers (aligned with define-all-apps.yml; source sensitive)
+    # IMA tiers (source sensitive)
     ["bc_ima_high"]="bc_linear_base/mtx___data_cit_Patents_1_0_3569341/traces/kernelslist.g"
     ["bc_ima_med"]="bc_linear_base/mtx___data_web_Google_1_0_506742/traces/kernelslist.g"
     ["bc_ima_small"]="bc_linear_base/mtx___data_web_Google_0_0_506742/traces/kernelslist.g"
@@ -434,7 +434,7 @@ declare -A TRACE_MAP=(
     ["symgs_ima_small"]="symgs_base/mtx___data_roadNet_CA_1/traces/kernelslist.g"
 
     # ============================================================
-    # 4-category dataset evaluation (2026-03-31)
+    # 4-category dataset evaluation
     # Naming: {algo}_{dataset}_{dir|sym}
     #   dir = directed (sym=0), sym = symmetrized (sym=1)
     #   Existing *_ima_{high,med} keys are reused where applicable
@@ -486,7 +486,6 @@ declare -A TRACE_MAP=(
 
     # ============================================================
     # Unified naming: {algo}_{dataset}_{dir|sym}
-    # These are canonical names used in benchmark_suite.md.
     # Old *_ima_* keys are kept above for backward compat.
     # ============================================================
 
@@ -549,31 +548,10 @@ declare -A TRACE_MAP=(
     ["sssp_topo_s0_web_sym"]="sssp_topo_base/mtx___data_web_Google_1_0_0_src0/traces/kernelslist.g"
 
 
-    # flash attention
-    ["fa"]="fa/NO_ARGS/traces/kernelslist.g"
-    ["fa4k"]="fa_4096seq/NO_ARGS/traces/kernelslist.g"
-    ["fi_dec_512"]="flashinfer_decode_512/NO_ARGS/traces/kernelslist.g"
-    ["fi_dec_4k"]="flashinfer_decode_4096/NO_ARGS/traces/kernelslist.g"
     ["ima_tiny_case"]="ima_tiny_case/NO_ARGS/traces/kernelslist.g"
     ["ima_tiny_case_current"]="ima_tiny_case_current/NO_ARGS/traces/kernelslist.g"
 
-    #cache strategy
-    ["wb"]="/strategybench.sm80/__test_alloc___store_wb/traces/kernelslist.g"
-    ["wb2"]="/strategybench.sm80/__test_alloc2___store_wb/traces/kernelslist.g"
-    ["cg"]="/strategybench.sm80/__test_alloc___store_cg/traces/kernelslist.g"
-
     
-    # GEMM series
-    ["gemm128"]="gemm128/NO_ARGS/traces/kernelslist.g"
-    ["gemm256"]="gemm256/NO_ARGS/traces/kernelslist.g"
-    ["gemm384"]="gemm384/NO_ARGS/traces/kernelslist.g"
-    ["gemm512"]="gemm512/NO_ARGS/traces/kernelslist.g"
-    ["gemm768"]="gemm768/NO_ARGS/traces/kernelslist.g"
-    ["gemm1024"]="gemm1024/NO_ARGS/traces/kernelslist.g"
-    ["gemm1536"]="gemm1536/NO_ARGS/traces/kernelslist.g"
-    ["gemm2048"]="gemm2048/NO_ARGS/traces/kernelslist.g"
-    ["gemm4096"]="gemm4096/NO_ARGS/traces/kernelslist.g"
-    ["gemm_cublas"]="gemm_cublas/NO_ARGS/traces/kernelslist.g"
     
     # Rodinia benchmark series
     ["btree"]="b+tree-rodinia-3.1/file___data_mil_txt_command___data_command_txt/traces/kernelslist.g"
@@ -675,10 +653,6 @@ declare -A TRACE_MAP=(
 
 # n_level warp alloc file mapping (uses trace_key by default; gto uses <trace_key>gto)
 declare -A NLEVEL_WARP_ALLOC_MAP=(
-    ["fa"]="gpu-simulator/gpgpu-sim/n-level/output/fa_issue_warp_allocate.csv"
-    ["fa4k"]="gpu-simulator/gpgpu-sim/n-level/output/fa4k_issue_warp_allocate.csv"
-    ["fa4kgto"]="gpu-simulator/gpgpu-sim/n-level/output/fa4k_gto_issue_warp_allocate.csv"
-    ["smpv_cu"]="gpu-simulator/gpgpu-sim/n-level/output/smpv_cu_issue_warp_allocate.csv"
 )
 
 # Show usage instructions
@@ -746,14 +720,11 @@ show_usage() {
     done | sort
     echo ""
     echo "Examples:"
-    echo "  $0 gemm128              # Run the GEMM128 benchmark with the default configuration"
-    echo "  $0 -c SM80_A100 gemm128 # Run using the SM80_A100 configuration"
+    echo "  $0 bfs_web              # Run BFS on web-Google with the default configuration"
+    echo "  $0 -c SM80_A100 bfs_web # Run using the SM80_A100 configuration"
     echo "  $0 btree my_test        # Run the B+Tree benchmark with a custom log name"
     echo "  $0 2mm 2mm_experiment   # Run the Polybench 2MM benchmark with a custom log name"
-    echo "  $0 -gto fa              # Run FA with the gto scheduler enabled"
-    echo "  $0 -nl fa               # Run FA with the n_level scheduler enabled"
-    echo "  $0 -nl -nls gto fa4k     # n_level using the gto default scheduler, matched with the corresponding warp alloc file"
-    echo "  $0 -nl -nls lrr fa4k     # n_level using the lrr default scheduler (default behavior)"
+    echo "  $0 -gto bfs_web         # Run with the gto scheduler enabled"
     echo "  $0 --plot sssp           # Automatically plot in parallel and show progress after it finishes"
     echo "  $0 --plot --plot-format png sssp     # Auto-plot with PNG output"
     echo "  $0 --plot --plot-format both sssp    # Auto-plot with both SVG+PNG output"

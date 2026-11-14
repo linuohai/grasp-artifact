@@ -66,7 +66,7 @@ Not included in this repository
 
 - **SOTA baseline prefetcher implementations** (Spare Register / Snake / CAPS) — the paper's evaluation reproduces them from their original publications; this repository ships only their *effective configuration values* (see `README.md`'s baseline configuration table), not source code.
 - **Workload sources / datasets / pre-generated traces** — obtain via `get-accel-sim-traces.py` (public Accel-Sim traces) or generate your own with the standard Accel-Sim NVBit tracer against your own CUDA workloads; see `README.md`.
-- **RTL / synthesis artifacts** — not part of this simulator repository; will accompany the camera-ready release.
+- **RTL / synthesis artifacts** — not part of this simulator repository.
 
 How to read this document
 -----------------------------

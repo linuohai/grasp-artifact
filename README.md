@@ -1,19 +1,20 @@
-# GRASP: Register-Chain-Aware GPU Prefetching (Anonymous Artifact)
+# GRASP: Register-Chain-Aware GPU Prefetching
 
-This repository accompanies a double-blind submission. It contains the
-GRASP prefetcher implementation as a set of source files that overlay a
-public simulator framework, plus the scripts and offline data needed to
-reproduce the paper's GRASP results.
+This repository is the artifact for the paper "GRASP: ISA-Exposed
+Register-Chain Prefetching for Indirect Memory Access on GPUs" (IEEE ICCD
+2026). It contains the GRASP prefetcher implementation as a set of source
+files that overlay a public simulator framework, plus the scripts and
+offline data needed to reproduce the paper's GRASP results.
 
 It does **not** contain: the SOTA baseline prefetcher implementations
 (Snake, CAPS, Spare Register) — Section "Baseline Configuration" below
 discloses their exact effective parameters instead of shipping code;
 workload sources, datasets, or pre-generated instruction traces; or the
-RTL/synthesis artifacts (these will accompany the camera-ready release).
+RTL/synthesis artifacts.
 
 ## 1. What this repository is
 
-This is **based on the Accel-Sim framework's `dev` branch (post-v1.3.0)**,
+This is **based on the Accel-Sim framework's `dev` branch (post-v1.3.0, upstream commit `d7f397a`)**,
 which in turn wraps GPGPU-Sim 4.x. GRASP is implemented as a new prefetcher
 module plus a small set of hooks into the upstream simulator core (cache,
 core pipeline, memory-request object). `docs/grasp_hook_points.md`
@@ -51,16 +52,23 @@ docs/grasp_hook_points.md      # file-by-file diff summary against upstream
 
 ## 2. Build
 
-1. Clone the upstream framework and initialize its GPGPU-Sim submodule:
+1. Clone the upstream framework and GPGPU-Sim, and check out the two
+   commits this overlay was written against:
    ```
-   git clone --recurse-submodules -b dev \
+   git clone -b dev \
        https://github.com/accel-sim/accel-sim-framework.git upstream-accel-sim
+   git -C upstream-accel-sim checkout d7f397a1766103cb9504715dfd8150da7c451607
+   git clone -b dev \
+       https://github.com/accel-sim/gpgpu-sim_distribution.git \
+       upstream-accel-sim/gpu-simulator/gpgpu-sim
+   git -C upstream-accel-sim/gpu-simulator/gpgpu-sim \
+       checkout b18ee3977962921c49fabe06d26ae19694497c26
    ```
-   (If the clone does not pull GPGPU-Sim as a nested checkout, run
-   `cd upstream-accel-sim/gpu-simulator/gpgpu-sim && git checkout dev` after
-   cloning `https://github.com/accel-sim/gpgpu-sim_distribution.git dev`
-   into that path — some upstream snapshots ship it as a plain directory
-   rather than a `.gitmodules` submodule.)
+   GPGPU-Sim is not a git submodule of the framework at this commit. Clone
+   it by hand as shown, before step 3: if the directory is missing,
+   `setup_environment.sh` clones the current `dev` branch instead, and
+   newer `dev` snapshots changed interfaces the overlay calls
+   (`linear_to_raw_address_translation::init`), so the build fails.
 
 2. Overlay this repository's `gpu-simulator/` directory on top, replacing
    files with the same relative path and adding the ones that don't yet
@@ -74,7 +82,8 @@ docs/grasp_hook_points.md      # file-by-file diff summary against upstream
    cd upstream-accel-sim
    ```
 
-3. Build (standard Accel-Sim flow; requires a CUDA toolkit and gcc/g++):
+3. Build (standard Accel-Sim flow; requires a CUDA toolkit and gcc/g++;
+   tested with gcc 13.3.0 and CUDA 12.8):
    ```
    source ./gpu-simulator/setup_environment.sh
    make -j -C ./gpu-simulator/
@@ -145,13 +154,16 @@ workload-specific). Two options:
   your own workload sources, then add an entry to `traceL1`'s `TRACE_MAP`
   pointing at the resulting trace directory.
 
-GRASP's register-chain catalog (`data/golden_chains/`) is independent of
-which trace you run — it identifies IMA (indirect-memory-access) load
-chains by source PC and SASS opcode, matched against whatever kernel PCs
-appear in your trace at runtime.
+GRASP's register-chain catalog (`data/golden_chains/`) identifies IMA
+(indirect-memory-access) load chains by kernel function name, instruction
+PC, and SASS opcode, and matches them against the kernel PCs that appear
+in your trace at runtime. The shipped catalog was extracted from the
+workload binaries used in the paper (its `algorithm`, `impl`, `sm`, and
+`function` columns record which). A trace recorded from a different build
+of a workload has different PCs and needs a catalog extracted from that
+build.
 
-## 5. Baseline Configuration (responds to reviewer comment on baseline
-   configuration transparency)
+## 5. Baseline Configuration
 
 The three SOTA prefetchers compared against GRASP in the paper — Snake
 (variable-length stride-chain prefetching), CAPS (CTA-aware prefetching),
@@ -231,6 +243,26 @@ Notes:
 
 ## 6. Attribution
 
+If you use this repository, please cite the GRASP paper:
+
+Haonan Sun, Chen Yang, Xiaobin Men, Zhuowei She, and Hu He, "GRASP:
+ISA-Exposed Register-Chain Prefetching for Indirect Memory Access on GPUs,"
+in Proc. IEEE International Conference on Computer Design (ICCD), 2026.
+
+```bibtex
+@inproceedings{sun2026grasp,
+  title     = {{GRASP}: {ISA}-Exposed Register-Chain Prefetching for Indirect Memory Access on {GPUs}},
+  author    = {Sun, Haonan and Yang, Chen and Men, Xiaobin and She, Zhuowei and He, Hu},
+  booktitle = {Proc. IEEE International Conference on Computer Design (ICCD)},
+  year      = {2026}
+}
+```
+
 This work is based on the Accel-Sim framework's `dev` branch
-(post-v1.3.0), which wraps GPGPU-Sim. Please cite the Accel-Sim and
-GPGPU-Sim papers when using this simulator.
+(post-v1.3.0, upstream commit `d7f397a`), which wraps GPGPU-Sim. Please cite
+the Accel-Sim and GPGPU-Sim papers when using this simulator. The
+GRASP-specific files in this repository are released under the BSD 3-Clause
+License (see `LICENSE`); files derived from Accel-Sim and GPGPU-Sim keep their
+original license headers. The upstream license texts are
+reproduced in `third_party/ACCEL-SIM-LICENSE` and
+`third_party/GPGPU-SIM-COPYRIGHT`.
